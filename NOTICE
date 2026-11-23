@@ -30,6 +30,11 @@ Tests and tools (tests/)
     test_megatron.py --moe_routing.
   - perfdb/bench.py: Generic op timing (schema-aligned arguments, crash-isolated
     worker, complex dtypes).
+    Accuracy fixes (measured against real A100 runs): optional distinct operand
+    buffers (PERFDB_ALIAS=0; upstream shares same-size operands, which made
+    memory-bound multi-operand ops 30-50% too fast), 0-dim double/long operands
+    of typed ops on the CPU (wrapped Python scalars), "f" floats as 2.0 (the
+    norm order training uses); --merge keeps the DB manifest.
   - perfdb/{l40s,a100_40g,h100,h200,b200,b300}_v1: timing databases recorded
     with bench.py (FILLED.md lists entries taken from a sibling GPU).
 

@@ -68,11 +68,16 @@ def expand(v):
     return v
 
 
-# Per-op allocation cache keyed by (numel, dtype), mirroring torch_estimate.rs's
-# `allocate`/`tensor_cache`: within one op, operands of the same size+dtype reuse
-# (alias) one buffer. This matters for memory-bound multi-operand ops (e.g. the
-# Adam `_foreach_addc*_` step) -- aliasing ~halves memory traffic, so reproducing
-# it keeps the bench's timings consistent with a Phantora-recorded DB.
+# Operand buffers. Upstream Phantora's record mode (torch_estimate.rs `allocate`/
+# `tensor_cache`) lets operands of the same (numel, dtype) share one buffer. Real
+# training never aliases them, and for memory-bound multi-operand ops (Adam's
+# `_foreach_addcdiv_`/`_addcmul_`/`_lerp_`, grad `add_`) sharing cuts DRAM traffic by
+# up to half: measured on A100 (cluster-sim tools/accuracy), it made those ops 30-50%
+# too fast. PERFDB_ALIAS=0 makes operands distinct (an op whose distinct operands do
+# not fit in memory falls back to shared buffers). The default stays 1 (shared) so
+# that shapes merged into an existing *_v1 DB match the timings already in it;
+# record a whole new DB generation with PERFDB_ALIAS=0.
+ALIAS = os.environ.get("PERFDB_ALIAS", "1") == "1"
 _ACACHE = {}
 
 
@@ -84,13 +89,23 @@ def _make(shape, dt, device):
     return torch.randint(0, 128, shape, dtype=dt, device=device)
 
 
-def alloc(ti, device="cuda", requires_grad=False):
+def alloc(ti, device="cuda", requires_grad=False, share=None):
     """Allocate a tensor matching a TensorInfo {shape, dtype}, reusing a cached
     buffer of the same (numel, dtype) like Phantora does (autograd leaves excepted)."""
     shape = ti["shape"]
     dt = DTYPE.get(ti["dtype"], torch.float32)
     if requires_grad:  # autograd leaves must be distinct, not aliased views
         return _make(shape, dt, device).detach().requires_grad_(True)
+    if shape == [] and dt in (torch.float64, torch.int64):
+        # a 0-dim double/long operand of a typed op is a wrapped Python scalar
+        # (x.mul_(0.5), x + 1): PyTorch keeps those on the CPU, which selects the
+        # scalar kernel; on the GPU it would take a slower tensor-tensor path
+        return _make(shape, dt, "cpu")
+    if not (ALIAS if share is None else share):
+        try:
+            return _make(shape, dt, device)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()  # too big to keep distinct: share as upstream does
     numel = 1
     for d in shape:
         numel *= d
@@ -256,7 +271,10 @@ def _g_unwrap(a):
     if k == "I":
         return int(v)
     if k == "F":
-        return 0.5 if v == "f" else float(v)
+        # "f" = a float other than 0/1 (keys drop the value: LRs change every step).
+        # 2.0 rather than an arbitrary value: for norms it is the ord training uses
+        # (grad clipping), and 0.5 sent linalg_vector_norm down a 2-3x slower path.
+        return 2.0 if v == "f" else float(v)
     if k == "B":
         return bool(v)
     if k == "S":
@@ -350,7 +368,7 @@ def _materialise(v, bound, alias=True):
         if v.cpu:
             return torch.ones(shape, dtype=dt)
         if dt.is_floating_point or dt.is_complex:
-            return alloc(v.ti) if alias else _make(shape, dt, "cuda")
+            return alloc(v.ti, share=True) if alias else _make(shape, dt, "cuda")
         if dt == torch.bool:
             return torch.randint(0, 2, shape, device="cuda").to(torch.bool)
         return torch.randint(0, bound, shape, dtype=dt, device="cuda")
@@ -373,9 +391,9 @@ def build_generic(P):
         if al is None:
             continue
         pos, kw = al
-        # Operands of equal size share a buffer (as Phantora's record mode does);
-        # in-place ops may refuse that (self overlaps values), so retry unshared.
-        for alias in (True, False):
+        # Distinct operands first (see ALIAS); shared buffers as the fallback when
+        # distinct ones do not fit (or, with PERFDB_ALIAS=1, first).
+        for alias in ((True, False) if ALIAS else (False, True)):
             try:
                 _ACACHE.clear()
                 pos_t = [_materialise(v, bound, alias) for v in pos]
@@ -666,10 +684,29 @@ def main():
                     n_ok += 1
                     rows[(key,)] = [key, nanos]
                     continue
-                thunk = build(op, expand(obj[op]))
-                if thunk is None:
-                    raise NotImplementedError(op)
-                nanos = timer(thunk, args.warmup, args.iters)
+                global ALIAS
+                try:
+                    thunk = build(op, expand(obj[op]))
+                    if thunk is None:
+                        raise NotImplementedError(op)
+                    nanos = timer(thunk, args.warmup, args.iters)
+                except torch.cuda.OutOfMemoryError:
+                    if ALIAS:
+                        raise
+                    # distinct operands (and outputs) do not fit: time with shared buffers
+                    thunk = None
+                    torch.cuda.empty_cache()
+                    ALIAS = True
+                    try:
+                        thunk = build(op, expand(obj[op]))
+                        nanos = timer(thunk, args.warmup, args.iters)
+                    finally:
+                        ALIAS = False
+                        thunk = None
+                        _ACACHE.clear()
+                        torch.cuda.empty_cache()
+                    print(f"  note {op}: too large for distinct operands; timed with shared buffers",
+                          file=sys.stderr)
                 n_ok += 1
             except Exception as e:  # keep the DB complete; carry the reference time
                 nanos = int(ref_nanos)
