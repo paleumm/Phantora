@@ -9,3 +9,11 @@
 /.venv/
 /.vscode/
 __pycache__/
+
+# cluster-sim run outputs (large; regenerable)
+/tests/traces/
+/tests/perfdb/_run/
+/tests/perfdb/discover/
+/tests/perfdb/*.missing/
+/tests/perfdb/*.dropped_ops.csv
+/tests/assets/hf_tokenizer/
