@@ -37,6 +37,9 @@ Tests and tools (tests/)
     norm order training uses); --merge keeps the DB manifest.
   - perfdb/{l40s,a100_40g,h100,h200,b200,b300}_v1: timing databases recorded
     with bench.py (FILLED.md lists entries taken from a sibling GPU).
+  - perfdb/{l40s,a100_40g,h100,h200,b200,b300}_v2: the same key set re-recorded
+    with the bench.py accuracy fixes (PERFDB_ALIAS=0); profiler-dropped kernels
+    re-timed once, the rest listed in FILLED.md.
 
 Dockerfile
   - pyarrow pinned to 19.0.1 (newer releases need NumPy 2; breaks TorchTitan).
