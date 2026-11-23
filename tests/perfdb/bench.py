@@ -774,10 +774,20 @@ def main():
             print(f"  WARN sequence.csv: {n_seq} row(s) in {args.ref} cannot be re-profiled "
                   f"(hash-keyed sequences); not copied into {out}.", file=sys.stderr)
 
-    with open(os.path.join(out, "manifest.md"), "w") as f:
-        f.write(f"# Phantora performance database\n\n- **GPU:** {gpu}\n- **Schema version:** 1\n"
-                f"- Recorded by tests/perfdb/bench.py (stock PyTorch, no Phantora build) "
-                f"from keys in `{args.ref}`.\n")
+    mpath = os.path.join(out, "manifest.md")
+    if args.merge and read_manifest_gpu(out) == gpu:
+        # keep the DB's provenance; note the merge (the ref path is often a temp dir)
+        with open(mpath) as f:
+            text = f.read()
+        note = "- Later shapes were added with `bench.py --merge` on the same GPU type.\n"
+        if note not in text:
+            with open(mpath, "a") as f:
+                f.write(note)
+    else:
+        with open(mpath, "w") as f:
+            f.write(f"# Phantora performance database\n\n- **GPU:** {gpu}\n- **Schema version:** 1\n"
+                    f"- Recorded by tests/perfdb/bench.py (stock PyTorch, no Phantora build) "
+                    f"from keys in `{args.ref}`.\n")
     print(f"done -> {out}")
 
 
