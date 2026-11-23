@@ -22,6 +22,10 @@ Simulator (phantora/)
   - Timeline encoding fix: optional SDPA/Conv2d fields are no longer skipped by
     serde (bincode is not self-describing); perf-DB keys are unchanged.
   - Visualizer: no panic on NcclSend/NcclRecv; buffered JSON output.
+  - (branch multi-nic, experimental) One NIC per GPU: netconfig
+    nic_per_gpu = true makes endpoints <hostname>/nic<device>; cross-host ring
+    hops split into one rail-aligned channel per local GPU; send/recv use the
+    GPUs' own NICs. Off by default.
 
 Tests and tools (tests/)
   - phantora_utils.py: mark_step(); optional skewed MoE routing for Megatron
