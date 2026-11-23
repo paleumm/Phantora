@@ -22,6 +22,16 @@ Simulator (phantora/)
   - Timeline encoding fix: optional SDPA/Conv2d fields are no longer skipped by
     serde (bincode is not self-describing); perf-DB keys are unchanged.
   - Visualizer: no panic on NcclSend/NcclRecv; buffered JSON output.
+  - Untimed-kernel report: kernels launched from outside PyTorch's own libraries
+    (custom CUDA extensions via cudaLaunchKernel; Triton and other driver-API users
+    via cuLaunchKernel/cuLaunchKernelEx) are reported once per launch and listed in
+    <perf-db>.dropped_ops.csv as kernel:<library>:<kernel> (charged zero time, as
+    before). The library is the kernel symbol's (runtime API) or the caller's
+    (driver API), so PyTorch's own NVRTC kernels are not reported. Names in the CSV
+    are quoted. The CUDA stub's cuModuleGetFunction returns named handles and the
+    stub gains the driver calls Triton's launcher needs (cuLaunchKernelEx,
+    cuFuncGet/SetAttribute, cuPointerGetAttribute(s), context calls), with H100-like
+    values for the device attributes Triton reads.
 
 Tests and tools (tests/)
   - phantora_utils.py: mark_step(); optional skewed MoE routing for Megatron

@@ -490,10 +490,14 @@ pub extern "C" fn cuda_launch_kernel(
     let start_time = current_cpu_time_us();
 
     let raw_kernel_name;
+    let lib_path;
     unsafe {
         let mut dlinfo = mem::zeroed::<libc::Dl_info>();
         libc::dladdr(func, &mut dlinfo);
+        lib_path = c_str_or_empty(dlinfo.dli_fname);
         if dlinfo.dli_sname == ptr::null() {
+            report_untimed_kernel(&lib_path, "");
+            subtract_cpu_time(current_cpu_time_us() - start_time);
             return;
         }
         raw_kernel_name = ffi::CStr::from_ptr(dlinfo.dli_sname).to_str().unwrap();
@@ -531,10 +535,65 @@ pub extern "C" fn cuda_launch_kernel(
             false,
         );
         send_cuda_call(call);
+    } else if !kernel_name.starts_with("void flash_bwd_") {
+        // (the other flash-attention backward kernels are covered by the call above)
+        report_untimed_kernel(&lib_path, raw_kernel_name);
     }
 
     let end_time = current_cpu_time_us();
     subtract_cpu_time(end_time - start_time);
+}
+
+/// A kernel launched through the driver API (cuLaunchKernel / cuLaunchKernelEx), e.g.
+/// by Triton. `caller` is the launch call's return address, which identifies the
+/// launching library: PyTorch's own NVRTC kernels (jiterator) run inside an aten op
+/// the simulator already times, anything else is reported.
+#[no_mangle]
+pub extern "C" fn cuda_driver_launch_kernel(name: *const ffi::c_char, caller: *const ffi::c_void) {
+    let start_time = current_cpu_time_us();
+    let lib_path = unsafe {
+        let mut dlinfo = mem::zeroed::<libc::Dl_info>();
+        libc::dladdr(caller, &mut dlinfo);
+        c_str_or_empty(dlinfo.dli_fname)
+    };
+    let name = unsafe { c_str_or_empty(name) };
+    report_untimed_kernel(&lib_path, &name);
+    subtract_cpu_time(current_cpu_time_us() - start_time);
+}
+
+unsafe fn c_str_or_empty(p: *const ffi::c_char) -> String {
+    if p.is_null() {
+        String::new()
+    } else {
+        ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+    }
+}
+
+/// PyTorch's own libraries: their kernels run inside aten ops, which are timed per op.
+fn is_torch_library(lib_path: &str) -> bool {
+    let base = lib_path.rsplit('/').next().unwrap_or("");
+    base.starts_with("libtorch") || base.starts_with("libc10") || base.starts_with("libcaffe2")
+}
+
+/// Tell the simulator about a kernel it cannot time (one datagram per launch, so the
+/// count in dropped_ops.csv is the number of launches). `raw_name` may be mangled.
+fn report_untimed_kernel(lib_path: &str, raw_name: &str) {
+    if is_torch_library(lib_path) {
+        return;
+    }
+    let opts = cpp_demangle::DemangleOptions::new().no_params().no_return_type();
+    let name = cpp_demangle::Symbol::new(raw_name.as_bytes())
+        .ok()
+        .and_then(|s| s.demangle(&opts).ok())
+        .unwrap_or_else(|| raw_name.to_owned());
+    let name = if name.is_empty() { "<unnamed>".to_owned() } else { name };
+    send_to_simulator(
+        get_current_sim_time(),
+        CudaCall::UntimedKernel {
+            lib_path: lib_path.to_owned(),
+            name,
+        },
+    );
 }
 
 /// https://github.com/Dao-AILab/flash-attention/blob/v2.7.3/csrc/flash_attn/src/flash.h
@@ -1031,4 +1090,18 @@ pub extern "C" fn nccl_recv(
             stream: CudaStream { device, id: stream },
         })
     });
+}
+
+#[cfg(test)]
+mod untimed_kernel_tests {
+    use super::is_torch_library;
+
+    #[test]
+    fn torch_libraries_are_not_reported() {
+        assert!(is_torch_library("/phantora/pytorch/torch/lib/libtorch_cuda.so"));
+        assert!(is_torch_library("/phantora/pytorch/torch/lib/libc10_cuda.so"));
+        assert!(!is_torch_library("/root/.cache/torch_extensions/py311_cu128/csk_ext/csk_ext.so"));
+        assert!(!is_torch_library("/root/.triton/cache/ABC/cuda_utils.cpython-311-x86_64-linux-gnu.so"));
+        assert!(!is_torch_library(""));
+    }
 }

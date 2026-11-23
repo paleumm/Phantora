@@ -1,6 +1,8 @@
+#include "phantora.h"
 #include <cuda.h>
 #include <dlfcn.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 __attribute__((unused)) static void*
 load_original_func(const char* name)
@@ -114,12 +116,21 @@ cuModuleLoadData(CUmodule* module, const void* image)
     return CUDA_SUCCESS;
 }
 
+// A driver-API kernel handle: remembers the kernel's name so a launch can be
+// reported (it cannot be timed: see cuda_driver_launch_kernel).
+struct phantora_cufunc
+{
+    char name[256];
+};
+
 CUresult
 cuModuleGetFunction(CUfunction* hfunc, CUmodule hmod, const char* name)
 {
-    // TODO
-    static unsigned char zeros[256] = { 0 };
-    *hfunc = (CUfunction)zeros;
+    struct phantora_cufunc* f = calloc(1, sizeof *f);
+    if (!f)
+        return CUDA_ERROR_OUT_OF_MEMORY;
+    snprintf(f->name, sizeof f->name, "%s", name ? name : "");
+    *hfunc = (CUfunction)f;
     return CUDA_SUCCESS;
 }
 
@@ -136,15 +147,144 @@ cuLaunchKernel(CUfunction f,
                void** kernelParams,
                void** extra)
 {
-    // TODO
+    cuda_driver_launch_kernel(f ? ((struct phantora_cufunc*)f)->name : "",
+                              __builtin_return_address(0));
+    return CUDA_SUCCESS;
+}
+
+CUresult
+cuLaunchKernelEx(const CUlaunchConfig* config,
+                 CUfunction f,
+                 void** kernelParams,
+                 void** extra)
+{
+    cuda_driver_launch_kernel(f ? ((struct phantora_cufunc*)f)->name : "",
+                              __builtin_return_address(0));
+    return CUDA_SUCCESS;
+}
+
+// The rest of what Triton's launcher calls (triton/backends/nvidia/driver.c).
+CUresult
+cuFuncGetAttribute(int* pi, CUfunction_attribute attrib, CUfunction hfunc)
+{
+    *pi = attrib == CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK ? 1024 : 0;
+    return CUDA_SUCCESS;
+}
+
+CUresult
+cuFuncSetAttribute(CUfunction hfunc, CUfunction_attribute attrib, int value)
+{
+    return CUDA_SUCCESS;
+}
+
+CUresult
+cuFuncSetCacheConfig(CUfunction hfunc, CUfunc_cache config)
+{
+    return CUDA_SUCCESS;
+}
+
+CUresult
+cuOccupancyMaxActiveClusters(int* numClusters,
+                             CUfunction func,
+                             const CUlaunchConfig* config)
+{
+    *numClusters = 1;
+    return CUDA_SUCCESS;
+}
+
+CUresult
+cuPointerGetAttribute(void* data, CUpointer_attribute attribute, CUdeviceptr ptr)
+{
+    if (attribute == CU_POINTER_ATTRIBUTE_DEVICE_POINTER)
+        *(CUdeviceptr*)data = ptr;
+    else
+        *(int*)data = 0;
+    return CUDA_SUCCESS;
+}
+
+CUresult
+cuPointerGetAttributes(unsigned int numAttributes,
+                       CUpointer_attribute* attributes,
+                       void** data,
+                       CUdeviceptr ptr)
+{
+    for (unsigned int i = 0; i < numAttributes; i++)
+        cuPointerGetAttribute(data[i], attributes[i], ptr);
+    return CUDA_SUCCESS;
+}
+
+CUresult
+cuDeviceGet(CUdevice* device, int ordinal)
+{
+    *device = ordinal;
+    return CUDA_SUCCESS;
+}
+
+CUresult
+cuDevicePrimaryCtxRetain(CUcontext* pctx, CUdevice dev)
+{
+    return cuCtxGetCurrent(pctx);
+}
+
+CUresult
+cuCtxSetCurrent(CUcontext ctx)
+{
+    return CUDA_SUCCESS;
+}
+
+CUresult
+cuCtxGetLimit(size_t* pvalue, CUlimit limit)
+{
+    *pvalue = 0;
+    return CUDA_SUCCESS;
+}
+
+CUresult
+cuCtxSetLimit(CUlimit limit, size_t value)
+{
+    return CUDA_SUCCESS;
+}
+
+CUresult
+cuDriverGetVersion(int* driverVersion)
+{
+    *driverVersion = CUDA_VERSION;
     return CUDA_SUCCESS;
 }
 
 CUresult
 cuDeviceGetAttribute(int* pi, CUdevice_attribute attrib, CUdevice dev)
 {
-    // TODO
-    *pi = 0;
+    // Driver-API users (Triton) size their kernels from these; H100-like values let
+    // them compile and launch. Everything else stays 0 as before.
+    switch (attrib) {
+        case CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN:
+            *pi = 232448;
+            break;
+        case CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR:
+            *pi = 233472;
+            break;
+        case CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_BLOCK:
+            *pi = 65536;
+            break;
+        case CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT:
+            *pi = 132;
+            break;
+        case CU_DEVICE_ATTRIBUTE_WARP_SIZE:
+            *pi = 32;
+            break;
+        case CU_DEVICE_ATTRIBUTE_CLOCK_RATE:
+            *pi = 1980000;
+            break;
+        case CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE:
+            *pi = 2619000;
+            break;
+        case CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH:
+            *pi = 5120;
+            break;
+        default:
+            *pi = 0;
+    }
     return CUDA_SUCCESS;
 }
 

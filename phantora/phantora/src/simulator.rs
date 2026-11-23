@@ -475,7 +475,13 @@ impl Simulator {
         let mut rows: Vec<_> = self.dropped_ops.iter().collect();
         rows.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then(a.0.cmp(b.0)));
         for (name, (calls, ex)) in &rows {
-            out.push_str(&format!("{},{},\"{}\"\n", name, calls, ex.replace('"', "\"\"")));
+            // names are quoted: kernel names can contain commas (template arguments)
+            out.push_str(&format!(
+                "\"{}\",{},\"{}\"\n",
+                name.replace('"', "\"\""),
+                calls,
+                ex.replace('"', "\"\"")
+            ));
         }
         let total: u64 = rows.iter().map(|r| r.1 .0).sum();
         let top: Vec<String> = rows.iter().take(8).map(|r| format!("{} x{}", r.0, r.1 .0)).collect();
@@ -724,6 +730,11 @@ impl Simulator {
             }
             CudaCall::CudaAddLatency(stream, latency) => {
                 self.cuda_add_latency(host, curr_time, stream, latency, call);
+            }
+
+            CudaCall::UntimedKernel { lib_path, name } => {
+                let lib = untimed_kernel_lib(&lib_path);
+                self.note_dropped_torch_op(format!("kernel:{lib}:{name}"), Some(lib_path));
             }
 
             CudaCall::FlashAttnCall {
@@ -1938,5 +1949,39 @@ impl Simulator {
                 }
             }
         }
+    }
+}
+
+/// Short label for the library that launched an untimed kernel: the file name, or
+/// `triton` for Triton's per-kernel launchers (they live in ~/.triton/cache).
+fn untimed_kernel_lib(lib_path: &str) -> String {
+    if lib_path.contains("/.triton/") {
+        return "triton".to_owned();
+    }
+    let base = lib_path.rsplit('/').next().unwrap_or("");
+    let base = base.split(".cpython").next().unwrap_or(base);
+    let base = base.strip_suffix(".so").unwrap_or(base);
+    if base.is_empty() { "unknown".to_owned() } else { base.to_owned() }
+}
+
+#[cfg(test)]
+mod untimed_kernel_tests {
+    use super::untimed_kernel_lib;
+
+    #[test]
+    fn labels_the_launching_library() {
+        assert_eq!(
+            untimed_kernel_lib("/root/.cache/torch_extensions/py311_cu128/csk_ext/csk_ext.so"),
+            "csk_ext"
+        );
+        assert_eq!(
+            untimed_kernel_lib("/root/.triton/cache/ABC/cuda_utils.cpython-311-x86_64-linux-gnu.so"),
+            "triton"
+        );
+        assert_eq!(
+            untimed_kernel_lib("/usr/lib/python3/site-packages/apex/fused_adam_cuda.cpython-311-x86_64-linux-gnu.so"),
+            "fused_adam_cuda"
+        );
+        assert_eq!(untimed_kernel_lib(""), "unknown");
     }
 }

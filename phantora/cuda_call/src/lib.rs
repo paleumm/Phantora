@@ -210,6 +210,16 @@ pub enum CudaCall {
     /// index), recorded in the timeline when the stream reaches it. Sent by
     /// `phantora_mark` (Python: tests/phantora_utils.py `mark_step`).
     PhantoraMarker(CudaStream, i64),
+
+    /// A kernel launched from outside PyTorch's own libraries (a custom CUDA extension,
+    /// Triton, ...). The simulator cannot time it: it is charged zero time and listed in
+    /// <db>.dropped_ops.csv as kernel:<lib>:<name>. `lib_path` is the launching library.
+    /// Keep new variants last: bincode encodes the variant index, and timelines written
+    /// before must still decode.
+    UntimedKernel {
+        lib_path: String,
+        name: String,
+    },
 }
 
 impl CudaCall {
