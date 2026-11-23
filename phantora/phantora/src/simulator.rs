@@ -379,7 +379,7 @@ impl Simulator {
         (cuda, torch)
     }
 
-    pub fn new(netsim: netsim::simulator::Simulator) -> Self {
+    pub fn new(netsim: netsim::simulator::Simulator, nic_per_gpu: bool) -> Self {
         let (cuda_estimator, torch_estimator) = Self::build_estimators();
         Simulator {
             cuda_estimator,
@@ -393,7 +393,7 @@ impl Simulator {
             exited_hosts: HashMap::new(),
 
             nccl_unique_id: [0u8; 128],
-            nccl_ops: SimpleRing::default(),
+            nccl_ops: SimpleRing::with_nic_per_gpu(nic_per_gpu),
             comm_groups: HashMap::new(),
             init_waiting: HashMap::new(),
             split_waiting: HashMap::new(),
@@ -1597,7 +1597,7 @@ impl Simulator {
             P2PCallKind::Send => (endpoint, peer_endpoint),
             P2PCallKind::Recv => (peer_endpoint, endpoint),
         };
-        Self::schedule_p2p_flow(&mut self.queue, send_endpoint, recv_endpoint, key);
+        Self::schedule_p2p_flow(&mut self.queue, send_endpoint, recv_endpoint, key, self.nccl_ops.nic_per_gpu);
     }
 
     fn release_unmatched_p2p_barrier(queue: &mut EventQueue, endpoint: &P2PFlowEndpoint) {
@@ -1609,6 +1609,7 @@ impl Simulator {
         send: P2PFlowEndpoint,
         recv: P2PFlowEndpoint,
         key: &P2PKey,
+        nic_per_gpu: bool,
     ) {
         let send_bytes = send.count * send.dtype.size();
         let recv_bytes = recv.count * recv.dtype.size();
@@ -1621,7 +1622,12 @@ impl Simulator {
                 recv_bytes
             );
         }
-        let flow = netsim::Flow::new(send_bytes, &send.host.hostname, &recv.host.hostname, None);
+        let (src, dst) = crate::nccl_ops::flow_endpoints(
+            nic_per_gpu,
+            (&send.host, send.stream.device),
+            (&recv.host, recv.stream.device),
+        );
+        let flow = netsim::Flow::new(send_bytes, &src, &dst, None);
 
         let curr_time = send.curr_time.max(recv.curr_time);
         let flow_event = queue.add_action_or_point(

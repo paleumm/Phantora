@@ -25,6 +25,13 @@ pub struct Config {
 
     /// Topology settings
     pub topology: TopoArgs,
+
+    /// One NIC per GPU (cluster-sim): network endpoints are "<hostname>/nic<device>"
+    /// instead of "<hostname>", and host_mapping lists those NIC names. Collectives
+    /// across hosts are split into one ring channel per local GPU, each crossing hosts
+    /// on its own rail (NCCL's rail-aligned rings with PXN).
+    #[serde(default)]
+    pub nic_per_gpu: bool,
 }
 
 pub fn read_config<T: serde::de::DeserializeOwned, P: AsRef<path::Path>>(path: P) -> T {

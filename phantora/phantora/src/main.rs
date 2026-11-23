@@ -42,13 +42,20 @@ fn main_loop() {
     let netconfig: netsim::config::Config = netsim::config::read_config(&get_args().net_config);
     println!("netconfig: {:#?}", netconfig);
     let cluster = netsim::config::build_cloud(&netconfig);
+    let nic_per_gpu = netconfig.nic_per_gpu;
+    if nic_per_gpu {
+        assert!(
+            netconfig.host_mapping.iter().all(|h| h.contains("/nic")),
+            "nic_per_gpu = true needs host_mapping entries named <hostname>/nic<device>"
+        );
+    }
     let netsim = netsim::simulator::SimulatorBuilder::new()
         .with_setting(netconfig.simulator)
         .cluster(cluster)
         .host_mapping(netconfig.host_mapping)
         .build()
         .expect("Fail to create network simulator");
-    let mut simulator = simulator::Simulator::new(netsim);
+    let mut simulator = simulator::Simulator::new(netsim, nic_per_gpu);
 
     loop {
         let sz = recv_socket.recv(&mut buf).unwrap();
