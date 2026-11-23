@@ -1,7 +1,8 @@
 use cuda_call::{HostId, NcclDatatype};
 use netsim::Flow;
 
-pub(crate) type Trace = Vec<Flow>;
+/// The flows of one collective, each with its SENDER's rank in the communicator.
+pub(crate) type Trace = Vec<(Flow, i32)>;
 
 pub(crate) trait NcclOps {
     fn bcast(
@@ -61,7 +62,7 @@ impl NcclOps for SimpleRing {
         for i in 1..n {
             let src = &ranks[root as usize].0.hostname;
             let dst = &ranks[(root as usize + i) % n].0.hostname;
-            trace.push(Flow::new(size, src, dst, None));
+            trace.push((Flow::new(size, src, dst, None), root));
         }
         trace
     }
@@ -73,7 +74,7 @@ impl NcclOps for SimpleRing {
         for i in 0..n {
             let src = &ranks[i].0.hostname;
             let dst = &ranks[(i + 1) % n].0.hostname;
-            trace.push(Flow::new(size, src, dst, None));
+            trace.push((Flow::new(size, src, dst, None), i as i32));
         }
         trace
     }
@@ -86,7 +87,7 @@ impl NcclOps for SimpleRing {
         for i in 0..n {
             let src = &ranks[i].0.hostname;
             let dst = &ranks[(i + 1) % n].0.hostname;
-            trace.push(Flow::new(size, src, dst, None));
+            trace.push((Flow::new(size, src, dst, None), i as i32));
         }
         trace
     }
@@ -104,7 +105,7 @@ impl NcclOps for SimpleRing {
         for i in 0..n {
             let src = &ranks[i].0.hostname;
             let dst = &ranks[(i + 1) % n].0.hostname;
-            trace.push(Flow::new(size, src, dst, None));
+            trace.push((Flow::new(size, src, dst, None), i as i32));
         }
         trace
     }

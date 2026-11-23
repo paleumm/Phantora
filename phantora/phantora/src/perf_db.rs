@@ -132,7 +132,15 @@ fn compact_value(v: Value) -> Value {
                     }
                 }
             }
-            Value::Object(map.into_iter().map(|(k, val)| (k, compact_value(val))).collect())
+            // Optional `mask` / `bias` of SDPA, SDPAEfficientBackward, Conv2d: omit when
+            // None, keeping keys identical to DBs recorded before those fields existed.
+            // (Deserializing a missing Option field gives None.)
+            Value::Object(
+                map.into_iter()
+                    .filter(|(k, val)| !((k == "mask" || k == "bias") && val.is_null()))
+                    .map(|(k, val)| (k, compact_value(val)))
+                    .collect(),
+            )
         }
         Value::Array(arr) => {
             let items: Vec<Value> = arr.into_iter().map(compact_value).collect();

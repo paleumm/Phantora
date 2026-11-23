@@ -236,6 +236,40 @@ pub struct Simulator {
     // NCCL's peer ordering for repeated sends/receives.
     send_waiting: HashMap<P2PKey, VecDeque<P2PFlowEndpoint>>,
     recv_waiting: HashMap<P2PKey, VecDeque<P2PFlowEndpoint>>,
+
+    // Torch ops the simulator does not model (unknown name, or known name with args
+    // it cannot parse). They are charged ZERO time, so they are reported at exit in
+    // `<db>.dropped_ops.csv`: name -> (calls, args of the first call).
+    dropped_ops: std::collections::BTreeMap<String, (u64, String)>,
+    simulated_op_names: HashSet<String>,
+}
+
+/// Latency of one collective in microseconds: base + steps x hop, with NCCL ring step
+/// counts (all-reduce 2(n-1); all-gather, reduce-scatter, broadcast n-1). Both terms
+/// come from --nccl-base-latency-us / --nccl-hop-latency-us and default to 0 (off).
+fn nccl_latency_us(call: &CudaCall, n: usize) -> i64 {
+    let a = args::get_args();
+    if a.nccl_base_latency_us <= 0.0 && a.nccl_hop_latency_us <= 0.0 {
+        return 0;
+    }
+    let n = n.max(1) as f64;
+    let steps = match call {
+        CudaCall::NcclAllReduce { .. } => 2.0 * (n - 1.0),
+        _ => n - 1.0,
+    };
+    let us = a.nccl_base_latency_us + steps * a.nccl_hop_latency_us;
+    if us <= 0.0 { 0 } else { (us.round() as i64).max(1) }
+}
+
+/// Set the communicator rank recorded with a collective call (see the flow labelling).
+fn set_comm_rank(call: &mut CudaCall, rank: i32) {
+    match call {
+        CudaCall::NcclBcast { comm, .. }
+        | CudaCall::NcclAllReduce { comm, .. }
+        | CudaCall::NcclAllGather { comm, .. }
+        | CudaCall::NcclReduceScatter { comm, .. } => comm.rank = rank,
+        _ => {}
+    }
 }
 
 fn incr_nccl_id(id: &mut [u8; 128]) -> [u8; 128] {
@@ -369,6 +403,93 @@ impl Simulator {
             reduce_scatter_waiting: HashMap::new(),
             send_waiting: HashMap::new(),
             recv_waiting: HashMap::new(),
+            dropped_ops: Default::default(),
+            simulated_op_names: HashSet::new(),
+        }
+    }
+
+    /// True when a dropped call of `name` should carry its args as an example: only
+    /// for names never seen before, so args are formatted once per op name.
+    pub fn wants_torch_example(&self, name: &str) -> bool {
+        !self.simulated_op_names.contains(name) && !self.dropped_ops.contains_key(name)
+    }
+
+    pub fn note_simulated_torch_op(&mut self, name: &str) {
+        if !self.simulated_op_names.contains(name) {
+            self.simulated_op_names.insert(name.to_owned());
+        }
+    }
+
+    pub fn note_dropped_torch_op(&mut self, name: String, example: Option<String>) {
+        let e = self.dropped_ops.entry(name).or_insert((0, String::new()));
+        e.0 += 1;
+        if e.1.is_empty() {
+            if let Some(mut ex) = example {
+                ex.truncate(4000);
+                e.1 = ex;
+            }
+        }
+    }
+
+    /// Write `<timeline>.comms.json`: every communicator's members in rank order, so a
+    /// flow (comm id + sender rank in that communicator) maps to a host, process and
+    /// device. `global_rank` is the rank in the largest communicator (the world group).
+    fn write_comm_table(&self) {
+        let Some(tl) = &args::get_args().timeline_file else { return };
+        let world = self.comm_groups.values().max_by_key(|g| g.len());
+        let global = |h: &HostId, d: i32| -> Option<usize> {
+            world.and_then(|w| w.iter().position(|(wh, wd)| wh == h && *wd == d))
+        };
+        let mut comms: Vec<serde_json::Value> = self
+            .comm_groups
+            .iter()
+            .map(|(id, ranks)| {
+                serde_json::json!({
+                    "id": id.0.to_vec(),
+                    "size": ranks.len(),
+                    "ranks": ranks.iter().enumerate().map(|(r, (h, d))| serde_json::json!({
+                        "rank": r, "hostname": h.hostname, "pid": h.pid, "device": d,
+                        "global_rank": global(h, *d),
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        comms.sort_by_key(|c| std::cmp::Reverse(c["size"].as_u64()));
+        let path = std::path::PathBuf::from(format!("{}.comms.json", tl.display()));
+        if let Err(e) = std::fs::write(&path, serde_json::to_string(&comms).unwrap_or_default()) {
+            log::error!("failed to write {}: {e}", path.display());
+        }
+    }
+
+    fn write_dropped_ops(&self) {
+        let dir = match (&args::get_args().perf_db, &args::get_args().record_perf_db) {
+            (Some(d), _) | (None, Some(d)) => d.clone(),
+            (None, None) => return,
+        };
+        let path = std::path::PathBuf::from(format!("{}.dropped_ops.csv", dir.display()));
+        if self.dropped_ops.is_empty() {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+        let mut out = String::from("name,calls,example_args\n");
+        let mut rows: Vec<_> = self.dropped_ops.iter().collect();
+        rows.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then(a.0.cmp(b.0)));
+        for (name, (calls, ex)) in &rows {
+            out.push_str(&format!("{},{},\"{}\"\n", name, calls, ex.replace('"', "\"\"")));
+        }
+        let total: u64 = rows.iter().map(|r| r.1 .0).sum();
+        let top: Vec<String> = rows.iter().take(8).map(|r| format!("{} x{}", r.0, r.1 .0)).collect();
+        match std::fs::write(&path, out) {
+            Ok(()) => {
+                let msg = format!(
+                    "torch ops NOT simulated (charged zero time): {} op type(s), {} call(s); \
+                     top: {}. Full list: {}",
+                    rows.len(), total, top.join(", "), path.display()
+                );
+                log::warn!("{msg}");
+                eprintln!("WARNING: {msg}");
+            }
+            Err(e) => log::error!("failed to write {}: {e}", path.display()),
         }
     }
 
@@ -596,6 +717,10 @@ impl Simulator {
             }
             CudaCall::CudaEventQuery(event) => {
                 self.cuda_event_query(host, curr_time, event);
+            }
+            CudaCall::PhantoraMarker(stream, _tag) => {
+                // Same as a zero latency: an instant event on the stream, kept in the timeline.
+                self.cuda_add_latency(host, curr_time, stream, 0, call);
             }
             CudaCall::CudaAddLatency(stream, latency) => {
                 self.cuda_add_latency(host, curr_time, stream, latency, call);
@@ -1616,7 +1741,7 @@ impl Simulator {
                             torch_estimator,
                             stream_info,
                             queue,
-                            (host, stream),
+                            (host.clone(), stream.clone()),
                             vec![Some(waiting.comm_end_meta)],
                             None,
                             curr_time,
@@ -1624,13 +1749,40 @@ impl Simulator {
 
                         if waiting.waiting_for.is_empty() {
                             if let Some(waiting) = waitings.remove(idx) {
+                                // Optional per-collective latency (base + steps x hop, see
+                                // args): a delay between release and the flows, so small
+                                // collectives no longer complete in zero time.
+                                let lat = nccl_latency_us(&call, ranks.len());
+                                let flows_start = if lat > 0 {
+                                    let lat_ev = queue.add_action_or_point(
+                                        vec![Some(waiting.comm_start_meta)],
+                                        Some(Action::Computation(
+                                            NodeId(host.clone()),
+                                            lat,
+                                            ComputeMeta::Cuda(CudaCall::CudaAddLatency(
+                                                stream.clone(),
+                                                lat,
+                                            )),
+                                        )),
+                                        curr_time,
+                                    );
+                                    queue.add_dependency(waiting.comm_end_meta, Some(lat_ev));
+                                    lat_ev
+                                } else {
+                                    waiting.comm_start_meta
+                                };
                                 let comm_events: Vec<_> = waiting
                                     .trace
                                     .into_iter()
-                                    .map(|flow| {
+                                    .map(|(flow, src_rank)| {
+                                        // Label each flow with its own sender's rank. `call` is
+                                        // the last-arriving rank's call, so its comm.rank would
+                                        // otherwise be stamped on every flow of the collective.
+                                        let mut meta = call.clone();
+                                        set_comm_rank(&mut meta, src_rank);
                                         queue.add_action_or_point(
-                                            vec![Some(waiting.comm_start_meta)],
-                                            Some(Action::Communication(flow, call.clone())),
+                                            vec![Some(flows_start)],
+                                            Some(Action::Communication(flow, meta)),
                                             curr_time,
                                         )
                                     })
@@ -1719,6 +1871,9 @@ impl Simulator {
                 Err(e) => log::error!("perf-db record: failed to write {}: {e}", dir.display()),
             }
         }
+
+        self.write_dropped_ops();
+        self.write_comm_table();
 
         // In replay mode, report any shapes that weren't in the DB (discovery).
         // Write them to `<db>.missing/` so they can be profiled on a GPU with

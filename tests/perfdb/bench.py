@@ -36,6 +36,8 @@ DTYPE = {
     "Int": torch.int32, "Int64": torch.int64, "Half": torch.float16,
     "Float": torch.float32, "Double": torch.float64, "Bool": torch.bool,
     "BFloat16": torch.bfloat16,
+    # complex tensors appear in Generic ops (e.g. TorchTitan's RoPE: view_as_real, _conj)
+    "ComplexFloat": torch.complex64, "ComplexDouble": torch.complex128, "ComplexHalf": torch.complex32,
 }
 
 # Compact-tensor dtype code -> Kind name. Mirrors DTYPE_CODES in
@@ -75,7 +77,7 @@ _ACACHE = {}
 
 
 def _make(shape, dt, device):
-    if dt.is_floating_point:
+    if dt.is_floating_point or dt.is_complex:
         return torch.randn(shape, dtype=dt, device=device)
     if dt == torch.bool:
         return torch.randint(0, 2, shape, device=device).to(torch.bool)
@@ -110,6 +112,8 @@ def is_ti(x):
 def build(op, payload):
     P = payload
     _ACACHE.clear()  # fresh per op; aliases same-(numel,dtype) operands within this op
+    if op == "Generic":
+        return build_generic(P)
 
     def two():            # tuple of two TensorInfo
         return alloc(P[0]), alloc(P[1])
@@ -228,6 +232,238 @@ def build(op, payload):
     return None  # unknown op
 
 
+
+# ---------------------------------------------------------------------------
+# Generic ops: TorchCallInfo::Generic {name, args} -- any aten op the simulator has
+# no dedicated variant for. Run it through torch.ops.aten.<name>. The function tracer
+# omits None arguments, so the traced values are aligned to the op schema: a schema
+# argument that the next traced value does not fit is skipped (None / its default).
+# ---------------------------------------------------------------------------
+
+class _GT:  # a traced tensor argument, materialised later
+    def __init__(self, ti, cpu):
+        self.ti, self.cpu = ti, cpu
+
+
+def _g_unwrap(a):
+    (k, v), = a.items()
+    if k == "T":
+        return _GT(v, False)
+    if k == "CpuT":
+        return _GT(v, True)
+    if k == "TL":
+        return [_GT(t, False) for t in v]
+    if k == "I":
+        return int(v)
+    if k == "F":
+        return 0.5 if v == "f" else float(v)
+    if k == "B":
+        return bool(v)
+    if k == "S":
+        return str(v)
+    if k == "L":
+        return [_g_unwrap(x) for x in v]
+    if k == "Dev":
+        return torch.device("cpu" if v.lower().startswith("cpu") else "cuda")
+    raise ValueError(f"unknown generic arg {k}")
+
+
+def _base_type(ty):
+    """Schema type as Python prints it ('Tensor', 'List[Tensor]', 'Optional[List[int]]',
+    'number' for Scalar, 'int' also for ScalarType/MemoryFormat) -> (inner, optional)."""
+    if ty.startswith("Optional[") and ty.endswith("]"):
+        return ty[len("Optional["):-1], True
+    return ty, False
+
+
+def _fits(ty, v):
+    t, _ = _base_type(ty)
+    if isinstance(v, _GT):
+        return t == "Tensor"
+    if isinstance(v, list):
+        if not v:  # an empty list (e.g. fused AdamW's max_exp_avg_sqs) fits any list type
+            return t.startswith("List[")
+        if all(isinstance(x, _GT) for x in v):
+            return t in ("List[Tensor]", "List[Optional[Tensor]]")
+        return t.startswith("List[") and "Tensor" not in t
+    if isinstance(v, bool):
+        return t == "bool"
+    if isinstance(v, int):
+        return t in ("int", "SymInt", "number", "float", "List[int]", "List[SymInt]")
+    if isinstance(v, float):
+        return t in ("float", "number")
+    if isinstance(v, str):
+        return t == "str"
+    if isinstance(v, torch.device):
+        return t == "Device"
+    return False
+
+
+def _align(schema, vals):
+    """Assign traced values to schema arguments in order. -> (args, kwargs) or None."""
+    pos, kw, i = [], {}, 0
+    for arg in schema.arguments:
+        ty = str(arg.type)
+        if i < len(vals) and _fits(ty, vals[i]):
+            v = vals[i]
+            i += 1
+        elif arg.has_default_value():
+            v = arg.default_value
+        elif _base_type(ty)[1]:
+            v = None
+        else:
+            return None  # a required argument we cannot fill: wrong overload
+        if arg.kwarg_only:
+            kw[arg.name] = v
+        else:
+            pos.append(v)
+    return (pos, kw) if i == len(vals) else None
+
+
+def _index_bound(vals):
+    """Integer tensors (indices, targets) get values in [0, bound): the smallest
+    dimension > 1 among ALL tensors and int lists of the call (an index tensor can
+    index an integer tensor too, e.g. scatter into int32), so every index is valid
+    for whatever it indexes. Dimensions of 1 are skipped so e.g. an embedding lookup
+    with ids of shape [1, 1024] still spreads over 1024 rows."""
+    dims = []
+
+    def walk(v):
+        if isinstance(v, _GT):
+            dims.extend(d for d in v.ti["shape"] if d > 1)
+        elif isinstance(v, list):
+            for x in v:
+                if isinstance(x, int) and not isinstance(x, bool):
+                    if x > 1:
+                        dims.append(x)
+                else:
+                    walk(x)
+    for v in vals:
+        walk(v)
+    return max(1, min(dims + [128]))
+
+
+def _materialise(v, bound, alias=True):
+    if isinstance(v, _GT):
+        dt = DTYPE.get(v.ti["dtype"], torch.float32)
+        shape = v.ti["shape"]
+        if v.cpu:
+            return torch.ones(shape, dtype=dt)
+        if dt.is_floating_point or dt.is_complex:
+            return alloc(v.ti) if alias else _make(shape, dt, "cuda")
+        if dt == torch.bool:
+            return torch.randint(0, 2, shape, device="cuda").to(torch.bool)
+        return torch.randint(0, bound, shape, dtype=dt, device="cuda")
+    if isinstance(v, list):
+        return [_materialise(x, bound, alias) for x in v]
+    return v
+
+
+def build_generic(P):
+    name = P["name"]
+    if not name.startswith("aten::"):
+        raise NotImplementedError(name)
+    packet = getattr(torch.ops.aten, name.split("::", 1)[1])
+    vals = [_g_unwrap(a) for a in P["args"]]
+    bound = _index_bound(vals)
+    errors = []
+    for ov in packet.overloads():
+        fn = getattr(packet, ov)
+        al = _align(fn._schema, vals)
+        if al is None:
+            continue
+        pos, kw = al
+        # Operands of equal size share a buffer (as Phantora's record mode does);
+        # in-place ops may refuse that (self overlaps values), so retry unshared.
+        for alias in (True, False):
+            try:
+                _ACACHE.clear()
+                pos_t = [_materialise(v, bound, alias) for v in pos]
+                kw_t = {k: _materialise(v, bound, alias) for k, v in kw.items()}
+                fn(*pos_t, **kw_t)  # dry run: proves this overload accepts the arguments
+                torch.cuda.synchronize()
+            except Exception as e:  # noqa: BLE001 -- retry unshared, then the next overload
+                if "device-side assert" in str(e) or type(e).__name__ == "AcceleratorError":
+                    raise  # the CUDA context is poisoned: let the worker restart
+                errors.append(f"{ov}{'' if alias else '/unshared'}: {type(e).__name__}: {str(e)[:60]}")
+                continue
+            return lambda: fn(*pos_t, **kw_t)
+    raise NotImplementedError(f"{name}: no overload fits ({'; '.join(errors)[:200] or 'none aligned'})")
+
+
+def time_kernel_compute(thunk, warmup, iters):
+    """time_kernel without memcpy/memset activity: device copies inside a generic op
+    (copy_, clone, to) are already charged on Phantora's memcpy path."""
+    for _ in range(warmup):
+        thunk()
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        for _ in range(iters):
+            thunk()
+        torch.cuda.synchronize()
+    us = sum(
+        (getattr(e, "self_device_time_total", 0) or getattr(e, "self_cuda_time_total", 0))
+        for e in prof.key_averages()
+        if not (e.key.startswith("Memcpy") or e.key.startswith("Memset"))
+    )
+    return int(us * 1000 / iters)
+
+
+def generic_worker(inp, outp, warmup, iters):
+    """Time Generic keys one by one (`--generic-worker IN OUT`). Each result line is
+    flushed, so the parent can restart after a crash (e.g. a device-side assert,
+    which poisons the CUDA context) and skip the key that caused it."""
+    with open(inp) as f, open(outp, "a") as g:
+        for line in f:
+            key = json.loads(line)["key"]
+            obj = json.loads(key)
+            try:
+                _ACACHE.clear()
+                thunk = build_generic(expand(obj["Generic"]))
+                res = {"key": key, "nanos": time_kernel_compute(thunk, warmup, iters)}
+            except Exception as e:  # noqa: BLE001
+                res = {"key": key, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+                if "device-side assert" in str(e) or type(e).__name__ == "AcceleratorError":
+                    # The CUDA context is now unusable: record this key, then exit so the
+                    # parent restarts a fresh worker for the remaining keys.
+                    g.write(json.dumps(res) + "\n")
+                    g.flush()
+                    os._exit(3)
+            g.write(json.dumps(res) + "\n")
+            g.flush()
+            torch.cuda.empty_cache()
+
+
+def time_generic_isolated(keys, warmup, iters):
+    """Run generic_worker in a subprocess; restart after a crash, skipping the key
+    that was running. -> {key: nanos or error string}."""
+    import subprocess
+    import tempfile
+    done, todo = {}, list(keys)
+    tmp = tempfile.mkdtemp(prefix="bench_generic_")
+    while todo:
+        inp, outp = os.path.join(tmp, "in.jsonl"), os.path.join(tmp, "out.jsonl")
+        with open(inp, "w") as f:
+            for k in todo:
+                f.write(json.dumps({"key": k}) + "\n")
+        if os.path.exists(outp):
+            os.remove(outp)
+        rc = subprocess.run([sys.executable, "-I", os.path.abspath(__file__), "--generic-worker",
+                             inp, outp, str(warmup), str(iters)]).returncode
+        got = [json.loads(l) for l in open(outp)] if os.path.exists(outp) else []
+        for r in got:
+            done[r["key"]] = r.get("nanos", "ERR " + r.get("error", ""))
+        todo = todo[len(got):]
+        if todo and rc == 3:  # a key poisoned the CUDA context; it is recorded, restart
+            continue
+        if todo and rc != 0:  # the next key crashed the worker
+            done[todo[0]] = f"ERR worker crashed (exit {rc})"
+            todo = todo[1:]
+        elif todo:
+            break
+    return done
+
+
 def time_kernel(thunk, warmup, iters):
     """Kernel-only device time, mirroring Phantora's CUPTI sum: profile `iters`
     runs and sum each kernel's self device time (excludes launch/CPU overhead)."""
@@ -344,6 +580,9 @@ def read_manifest_gpu(db_dir):
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--generic-worker":
+        _, _, inp, outp, warmup, iters = sys.argv
+        return generic_worker(inp, outp, int(warmup), int(iters))
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--ref", required=True, help="reference DB dir to take keys from (e.g. tests/perfdb/l40s)")
     ap.add_argument("--out", default=None, help="output DB dir (default: tests/perfdb/<gpu-name>)")
@@ -405,14 +644,28 @@ def main():
     rows = load_existing(compute_out, 1) if args.merge else {}
     n_ok = n_skip = n_drop = 0
     with open(os.path.join(args.ref, "compute.csv")) as f:
-        r = csv.reader(f); next(r)
-        for row in r:
+        ref_rows = [row for row in csv.reader(f)][1:]
+    # Generic ops run in a crash-isolated subprocess (see time_generic_isolated).
+    gkeys = [row[0] for row in ref_rows if row and json.loads(row[0]).keys() == {"Generic"}]
+    generic = time_generic_isolated(gkeys, args.warmup, args.iters) if gkeys and not args.wall else {}
+    if gkeys:
+        g_err = sum(isinstance(v, str) for v in generic.values())
+        print(f"generic ops: {len(gkeys) - g_err} timed, {g_err} failed")
+    if True:
+        for row in ref_rows:
             if not row:
                 continue
             key, ref_nanos = row[0], row[1]
             obj = json.loads(key)
             op = next(iter(obj))
             try:
+                if op == "Generic" and key in generic:
+                    if isinstance(generic[key], str):
+                        raise RuntimeError(generic[key])
+                    nanos = generic[key]
+                    n_ok += 1
+                    rows[(key,)] = [key, nanos]
+                    continue
                 thunk = build(op, expand(obj[op]))
                 if thunk is None:
                     raise NotImplementedError(op)

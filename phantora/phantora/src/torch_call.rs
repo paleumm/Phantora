@@ -1000,6 +1000,20 @@ impl TorchCallMsg {
             },
             _ => None,
         };
+        // Fallback: any other op that launches GPU work becomes a Generic call, keyed by
+        // its name and arguments, so it is timed (by tests/perfdb/bench.py, which calls
+        // torch.ops.aten.<name> with the same arguments) instead of silently costing 0.
+        // Pure view/metadata ops launch no kernel and stay dropped.
+        let call_info = call_info.or_else(|| {
+            if NO_KERNEL_OPS.contains(&self.name.as_str()) {
+                return None;
+            }
+            let args: Option<Vec<GenericArg>> = self.args.iter().map(to_generic).collect();
+            args.map(|args| TorchCallInfo::Generic {
+                name: self.name.clone(),
+                args,
+            })
+        });
         call_info.map(|info| TorchCall {
             time: self.curr_time,
             id: ResponseId {
@@ -1064,9 +1078,10 @@ pub enum TorchCallInfo {
         q: TensorInfo,
         k: TensorInfo,
         v: TensorInfo,
-        // Omit when None so the serialized perf-db key matches the pre-mask
-        // spelling and re-records don't churn (perf_db.rs is the only serializer).
-        #[serde(skip_serializing_if = "Option::is_none")]
+        // A None mask is dropped from the perf-db key (perf_db.rs compact_value) so
+        // keys match the pre-mask spelling. Not via serde skip_serializing_if: the
+        // timeline is bincode, which is not self-describing, and a skipped field there
+        // makes every later record unreadable (visualizer panic on TorchTitan traces).
         mask: Option<TensorInfo>,
         causal: bool,
         gqa: bool,
@@ -1075,7 +1090,6 @@ pub enum TorchCallInfo {
         q: TensorInfo,
         k: TensorInfo,
         v: TensorInfo,
-        #[serde(skip_serializing_if = "Option::is_none")]
         bias: Option<TensorInfo>,
         causal: bool,
     },
@@ -1093,7 +1107,6 @@ pub enum TorchCallInfo {
     Conv2d {
         input: TensorInfo,
         weight: TensorInfo,
-        #[serde(skip_serializing_if = "Option::is_none")]
         bias: Option<TensorInfo>,
         stride: [i64; 2],
         padding: [i64; 2],
@@ -1108,7 +1121,85 @@ pub enum TorchCallInfo {
         stride: [i64; 2],
         padding: [i64; 2],
     },
+    /// Any other aten op (see `into_call`): its name and arguments as the tracer sent
+    /// them. Note the tracer omits `None` arguments; bench.py re-inserts them by
+    /// matching against the op schema. Timed only through the perf DB (bench.py).
+    Generic { name: String, args: Vec<GenericArg> },
 }
+
+/// One argument of a `Generic` call. Tensors keep the `{shape,dtype}` form so the
+/// perf DB compacts them; floats are kept as text ("f" for any value but 0 and 1).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum GenericArg {
+    /// CUDA tensor
+    T(TensorInfo),
+    /// CPU tensor (e.g. a 0-dim scalar passed as a tensor)
+    CpuT(TensorInfo),
+    /// list of CUDA tensors (foreach ops, cat, stack)
+    TL(Vec<TensorInfo>),
+    I(i64),
+    F(String),
+    B(bool),
+    S(String),
+    /// list or tuple of non-tensor values
+    L(Vec<GenericArg>),
+    Dev(String),
+}
+
+fn tensor_arg(shape: &[i64], kind: &tch::Kind, device: &tch::Device) -> GenericArg {
+    let info = TensorInfo {
+        shape: shape.to_vec(),
+        dtype: *kind,
+    };
+    match device {
+        tch::Device::Cuda(_) => GenericArg::T(info),
+        _ => GenericArg::CpuT(info),
+    }
+}
+
+pub fn to_generic(v: &TorchValue) -> Option<GenericArg> {
+    Some(match v {
+        TorchValue::Tensor(shape, kind, device) => tensor_arg(shape, kind, device),
+        TorchValue::List(items) | TorchValue::Tuple(items) => {
+            let all_cuda_tensors = !items.is_empty()
+                && items.iter().all(|x| {
+                    matches!(x, TorchValue::Tensor(_, _, tch::Device::Cuda(_)))
+                });
+            if all_cuda_tensors {
+                GenericArg::TL(maybe_tensor_list(items)?)
+            } else {
+                GenericArg::L(items.iter().map(to_generic).collect::<Option<Vec<_>>>()?)
+            }
+        }
+        // Float values almost never change which kernel runs, but many change every
+        // step (bias-corrected step size, LR schedules), which would make a new key
+        // per iteration. Keep only 0 and 1 (they can select fast paths); else "f".
+        TorchValue::Double(x) => GenericArg::F(if *x == 0.0 || *x == 1.0 {
+            format!("{:?}", x)
+        } else {
+            "f".to_owned()
+        }),
+        TorchValue::Int(x) => GenericArg::I(*x),
+        TorchValue::Bool(x) => GenericArg::B(*x),
+        TorchValue::String(x) => GenericArg::S(x.clone()),
+        TorchValue::Device(d) => GenericArg::Dev(format!("{:?}", d)),
+    })
+}
+
+/// Aten ops that only create views or touch metadata: no GPU kernel, so nothing to time.
+pub const NO_KERNEL_OPS: &[&str] = &[
+    "aten::view", "aten::view_as", "aten::_unsafe_view", "aten::_reshape_alias",
+    "aten::slice", "aten::select", "aten::narrow", "aten::chunk", "aten::split",
+    "aten::split_with_sizes", "aten::unbind", "aten::transpose", "aten::t",
+    "aten::permute", "aten::expand", "aten::expand_as", "aten::unsqueeze",
+    "aten::squeeze", "aten::unflatten", "aten::as_strided", "aten::alias",
+    "aten::detach", "aten::detach_", "aten::_has_compatible_shallow_copy_type",
+    "aten::numel", "aten::size", "aten::stride", "aten::is_nonzero",
+    "aten::lift_fresh", "aten::resolve_conj", "aten::resolve_neg", "aten::set_",
+    "aten::empty", "aten::empty_like", "aten::empty_strided", "aten::new_empty",
+    "aten::new_empty_strided", "aten::result_type", "aten::is_same_size",
+    "aten::record_stream", "aten::_local_scalar_dense",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TorchCall {

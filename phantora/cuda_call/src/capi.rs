@@ -434,6 +434,12 @@ pub extern "C" fn cuda_event_query(
     }
 }
 
+/// Put a zero-duration marker with `tag` on (device, stream) in the timeline.
+#[no_mangle]
+pub extern "C" fn phantora_mark(device: i32, stream: i32, tag: i64) {
+    send_cuda_call(CudaCall::PhantoraMarker(CudaStream { device, id: stream }, tag));
+}
+
 #[no_mangle]
 pub extern "C" fn cuda_add_latency(device: i32, stream: i32, latency: i64) {
     send_cuda_call(CudaCall::CudaAddLatency(

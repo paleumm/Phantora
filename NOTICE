@@ -1,0 +1,37 @@
+Phantora
+Copyright 2025 Phantora Contributors
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This fork (github.com/paleumm/Phantora, branch `cluster-sim`) modifies Phantora
+upstream commit 301d9d9. The changes, used by github.com/paleumm/cluster-sim:
+
+Simulator (phantora/)
+  - Generic op timing: any outermost aten op the simulator does not model is
+    keyed as TorchCallInfo::Generic {name, args} and timed from the perf DB
+    (tests/perfdb/bench.py runs it via torch.ops.aten), instead of silently
+    costing zero. View/metadata ops (NO_KERNEL_OPS) are skipped.
+  - Dropped-op report: ops that still cannot be simulated are written to
+    <perf-db>.dropped_ops.csv at exit.
+  - Sender rank per flow: each flow of a collective carries its own sender's
+    communicator rank; <timeline>.comms.json maps communicator ranks to host,
+    process, device and global rank.
+  - Step markers: PhantoraMarker(stream, tag) calls (phantora_mark in the C API,
+    mark_step in tests/phantora_utils.py) recorded in the timeline.
+  - NCCL collective latency: --nccl-base-latency-us / --nccl-hop-latency-us
+    (base + steps x hop; default 0, i.e. upstream behaviour).
+  - Timeline encoding fix: optional SDPA/Conv2d fields are no longer skipped by
+    serde (bincode is not self-describing); perf-DB keys are unchanged.
+  - Visualizer: no panic on NcclSend/NcclRecv; buffered JSON output.
+
+Tests and tools (tests/)
+  - phantora_utils.py: mark_step(); optional skewed MoE routing for Megatron
+    (PHANTORA_MOE_ROUTING=zipf:<s>).
+  - test_megatron.py, test_deepspeed.py, test_torchtitan.py: step markers;
+    test_megatron.py --moe_routing.
+  - perfdb/bench.py: Generic op timing (schema-aligned arguments, crash-isolated
+    worker, complex dtypes).
+  - perfdb/{l40s,a100_40g,h100,h200,b200,b300}_v1: timing databases recorded
+    with bench.py (FILLED.md lists entries taken from a sibling GPU).
+
+Dockerfile
+  - pyarrow pinned to 19.0.1 (newer releases need NumPy 2; breaks TorchTitan).

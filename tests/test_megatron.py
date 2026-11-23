@@ -1,4 +1,5 @@
 from phantora_utils import (
+    mark_step,
     time_pair,
     enable_function_tracer,
     disable_function_tracer,
@@ -385,6 +386,7 @@ def main(
     duras = []
     duras_wall = []
     for i in range(iterations):
+        mark_step(i)  # step boundary in the Phantora timeline
         if virtual_pipeline_model_parallel_size is None:
             train_iterator = get_train_data_iterator(vocab_size, micro_batch_size, sequence_length)
         else:
@@ -432,6 +434,7 @@ def main(
         print(f"rank {rank} iter {i} time: {end - start:.2f} wall: {end_wall - start_wall:.2f}\n", end="")
         duras.append(end - start)
         duras_wall.append(end_wall - start_wall)
+    mark_step(iterations)  # closes the last step
 
     peak_vram_mib = torch.cuda.max_memory_allocated(device) / (1024 * 1024)
     print(f"Rank {rank} Time: {duras} Avg Time: {sum(duras[1:]) / (iterations - 1):.2f}\n", end="")
@@ -477,12 +480,17 @@ if __name__ == "__main__":
     parser.add_argument("--moe_token_dispatcher_type", type=str, default="alltoall",
         choices=["allgather", "alltoall"])
     parser.add_argument("--expert_model_parallel_size", type=int, default=1)
+    parser.add_argument("--moe_routing", type=str, default=None,
+        help="Simulated MoE routing: 'uniform' (default) or 'zipf:<s>' for skewed expert "
+             "popularity (sets PHANTORA_MOE_ROUTING; see phantora_utils).")
     parser.add_argument("--kv_channels", type=int, default=None,
         help="Attention head_dim; None = hidden_size // num_attention_heads. "
              "Qwen3 and gpt-oss set this explicitly.")
     parser.add_argument("--qk_layernorm", action="store_true",
         help="Apply RMSNorm to Q and K (QK-norm); used by Qwen3.")
     args = parser.parse_args()
+    if args.moe_routing:
+        os.environ["PHANTORA_MOE_ROUTING"] = args.moe_routing
 
     enable_function_tracer()
     main(

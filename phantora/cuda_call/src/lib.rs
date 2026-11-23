@@ -205,6 +205,11 @@ pub enum CudaCall {
     },
 
     ReadTimer(CudaStream),
+
+    /// A zero-duration marker on a stream (e.g. a training-step boundary, tag = step
+    /// index), recorded in the timeline when the stream reaches it. Sent by
+    /// `phantora_mark` (Python: tests/phantora_utils.py `mark_step`).
+    PhantoraMarker(CudaStream, i64),
 }
 
 impl CudaCall {

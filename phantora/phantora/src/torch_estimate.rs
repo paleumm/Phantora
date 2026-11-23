@@ -58,6 +58,10 @@ pub struct TorchEstimator {
     // run completes and the full set of unrecorded shapes can be reported.
     replay: bool,
     missing: Vec<TorchCallInfo>,
+    // Record mode cannot time Generic ops (they need torch.ops via Python, which
+    // bench.py does). Remember which were seen so each is reported once and never
+    // memoized into compute_cache, which would save a fake zero into the DB.
+    generic_untimed: std::collections::HashSet<TorchCallInfo>,
 }
 
 impl TorchEstimator {
@@ -71,6 +75,7 @@ impl TorchEstimator {
             sequence_cache: BTreeMap::new(),
             replay: false,
             missing: Vec::new(),
+            generic_untimed: Default::default(),
         }
     }
 
@@ -86,6 +91,7 @@ impl TorchEstimator {
             sequence_cache,
             replay: true,
             missing: Vec::new(),
+            generic_untimed: Default::default(),
         }
     }
 
@@ -144,6 +150,8 @@ impl TorchEstimator {
 
     fn run(&mut self, niter: i32, call: &TorchCallInfo) -> Duration {
         match call {
+            // Never reached: estimate() handles Generic before calling run().
+            TorchCallInfo::Generic { .. } => Duration::ZERO,
             TorchCallInfo::MM(info1, info2) => {
                 let t1 = self.allocate(info1);
                 let t2 = self.allocate(info2);
@@ -583,6 +591,20 @@ impl TorchEstimator {
     pub fn estimate(&mut self, call: &TorchCallInfo) -> Duration {
         if let Some(value) = self.compute_cache.get(call) {
             *value
+        } else if let TorchCallInfo::Generic { name, .. } = call {
+            // Generic ops are timed only via the perf DB (bench.py runs them through
+            // torch.ops.aten). Not in the DB -> charge 0 and report it: as a missing
+            // shape in replay (so bench.py can fill it), or a warning in record mode.
+            if self.replay {
+                self.missing.push(call.clone());
+                self.compute_cache.insert(call.clone(), Duration::ZERO);
+            } else if self.generic_untimed.insert(call.clone()) {
+                log::warn!(
+                    "{name}: generic op is not timed in record mode (charged 0); \
+                     use --perf-db replay + tests/perfdb/bench.py to time it"
+                );
+            }
+            Duration::ZERO
         } else if self.replay {
             // Discovery: record the unrecorded shape and substitute a zero
             // placeholder so the run finishes and reports every missing shape.

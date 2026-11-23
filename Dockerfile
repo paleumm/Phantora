@@ -56,7 +56,10 @@ RUN curl -Lo torchtitan-requirements.txt https://raw.githubusercontent.com/pytor
 # torchtitan 0.2.0 adds MoE models (deepseek_v3/llama4/qwen3); it needs triton
 # (not pulled in automatically) and works on torch 2.9.1 (0.2.1+ require a torch
 # 2.10 attention API). The v0.1.0 CI requirements above remain sufficient.
-RUN python3 -m pip install --no-cache-dir megatron-core==0.13.1 transformers==4.56.2 deepspeed==0.17.5 torchtitan==0.2.0 numpy==1.26.4 triton==3.7.0
+# pyarrow (pulled in by torchtitan's `datasets`) is unpinned upstream and its newer
+# releases require NumPy 2, which breaks `import torchtitan.train` against numpy 1.26.4.
+# 19.0.1 is the newest tested release that still supports NumPy 1.x.
+RUN python3 -m pip install --no-cache-dir megatron-core==0.13.1 transformers==4.56.2 deepspeed==0.17.5 torchtitan==0.2.0 numpy==1.26.4 triton==3.7.0 pyarrow==19.0.1
 
 # DeepSpeed needs passwordless ssh
 COPY config/sshconfig /root/.ssh/config

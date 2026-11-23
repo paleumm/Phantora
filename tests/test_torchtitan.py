@@ -3,6 +3,7 @@ from phantora_utils import (
     enable_function_tracer,
     install_phantora_torchtitan_patches,
     install_phantora_torchtitan_moe_patches,
+    mark_step,
     time_pair,
 )
 
@@ -35,6 +36,7 @@ if __name__ == '__main__':
         train_step = trainer.train_step
 
         def timed_train_step(*args, **kwargs):
+            mark_step(len(duras))  # step boundary in the Phantora timeline
             start, start_wall = time_pair()
             result = train_step(*args, **kwargs)
             torch.cuda.synchronize()
@@ -47,6 +49,7 @@ if __name__ == '__main__':
         trainer.train_step = timed_train_step
         enable_function_tracer()
         trainer.train()
+        mark_step(len(duras))  # closes the last step
         if len(duras) > 1:
             avg_time = sum(duras[1:]) / (len(duras) - 1)
             avg_wall = sum(duras_wall[1:]) / (len(duras_wall) - 1)

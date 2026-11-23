@@ -232,7 +232,9 @@ fn main() {
     let mut host_rank_cnt = 0;
     let mut cnt = 0;
     let total_events = timeline.db.len();
-    let mut f = fs::File::create(&get_args().output).unwrap();
+    // Buffered: serde_json::to_writer emits each event in many small writes, which on
+    // an unbuffered File cost a syscall each (minutes for a 60 MB trace).
+    let mut f = io::BufWriter::with_capacity(1 << 20, fs::File::create(&get_args().output).unwrap());
     f.write(b"[\n").unwrap();
     for (_id, span) in timeline.db.iter() {
         if span.start == 0 {
@@ -264,7 +266,12 @@ fn main() {
                 }
             }
             Action::Communication(flow, meta) => {
-                let stream = meta.get_cuda_stream().unwrap();
+                // NcclSend/NcclRecv carry no stream in CudaCall::get_cuda_stream (they are
+                // grouped p2p calls), so unwrap() panicked on any MoE or pipeline trace.
+                // The stream is only used as the Perfetto track id: default to 0/0.
+                let stream = meta
+                    .get_cuda_stream()
+                    .unwrap_or(cuda_call::CudaStream { device: 0, id: 0 });
                 let name = meta.to_string();
                 let cat = "Communication".to_owned();
                 let ph = chrome::Phase::X;

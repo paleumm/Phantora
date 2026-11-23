@@ -15,6 +15,15 @@ pub struct Args {
     #[arg(long)]
     pub timeline_file: Option<path::PathBuf>,
 
+    /// Fixed latency added to every NCCL collective, in microseconds (default 0 = off).
+    #[arg(long = "nccl-base-latency-us", default_value_t = 0.0)]
+    pub nccl_base_latency_us: f64,
+
+    /// Latency per ring step of an NCCL collective, in microseconds (default 0 = off).
+    /// All-reduce has 2(n-1) steps; all-gather, reduce-scatter and broadcast n-1.
+    #[arg(long = "nccl-hop-latency-us", default_value_t = 0.0)]
+    pub nccl_hop_latency_us: f64,
+
     /// Core indices that are available for the applications, like "2,4-6,8" for cores 2,4,5,6,8.
     #[arg(long, value_parser = parse_cores)]
     pub available_cores: Option<std::vec::Vec<usize>>,

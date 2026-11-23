@@ -448,6 +448,69 @@ def install_phantora_torchtitan_patches() -> None:
     tt_pipeline.PipelineStage = CpuMetaPipelineStage
 
 
+_MOE_LAYER_IDS = {}
+
+
+def _phantora_moe_counts(dispatcher, num_tokens, topk, ne):
+    """Tokens each EP rank routes to each expert, or None for uniform routing.
+
+    Set PHANTORA_MOE_ROUTING=zipf:<s> (e.g. zipf:1.2) for skewed routing: expert
+    popularity follows Zipf(s) over a per-layer random ranking (seeded by
+    PHANTORA_MOE_SEED, default 0), the same on every rank, so all ranks agree on the
+    all-to-all sizes. Each expert gets at most `num_tokens` (a token picks an expert
+    at most once). Counts are multiples of PHANTORA_MOE_QUANTUM (default 64) and stay
+    fixed across steps, so they add a bounded set of new kernel shapes. -> list[ne].
+    """
+    spec = os.environ.get("PHANTORA_MOE_ROUTING", "uniform")
+    if not spec.startswith("zipf:"):
+        return None
+    import random
+    s = float(spec.split(":", 1)[1])
+    seed = int(os.environ.get("PHANTORA_MOE_SEED", "0"))
+    q = max(1, int(os.environ.get("PHANTORA_MOE_QUANTUM", "64")))
+    layer = _MOE_LAYER_IDS.setdefault(id(dispatcher), len(_MOE_LAYER_IDS))
+    order = list(range(ne))
+    random.Random(seed * 1000003 + layer).shuffle(order)
+    w = [0.0] * ne
+    for k, e in enumerate(order):
+        w[e] = 1.0 / (k + 1) ** s
+    total, cap = num_tokens * topk, num_tokens
+    # water-filling: proportional shares, capped at `cap`, remainder redistributed
+    alloc, free = [0.0] * ne, set(range(ne))
+    left = float(total)
+    while left > 1e-9 and free:
+        ws = sum(w[e] for e in free)
+        over = False
+        for e in list(free):
+            share = left * w[e] / ws
+            if alloc[e] + share >= cap:
+                left -= cap - alloc[e]
+                alloc[e] = cap
+                free.discard(e)
+                over = True
+        if not over:
+            for e in free:
+                alloc[e] += left * w[e] / ws
+            left = 0.0
+    # quantise to multiples of q, keeping the exact total
+    counts = [int(a // q) * q for a in alloc]
+    rest = total - sum(counts)
+    for e in sorted(range(ne), key=lambda e: alloc[e] - counts[e], reverse=True):
+        if rest <= 0:
+            break
+        add = min(q, rest, cap - counts[e])
+        counts[e] += add
+        rest -= add
+    i = 0
+    while rest > 0 and i < ne:  # leftovers smaller than q
+        e = order[i]
+        add = min(rest, cap - counts[e])
+        counts[e] += add
+        rest -= add
+        i += 1
+    return counts
+
+
 def install_phantora_megatron_moe_patches() -> None:
     """Make Megatron-core MoE runnable under Phantora's payload-free simulation.
 
@@ -539,6 +602,27 @@ def install_phantora_megatron_moe_patches() -> None:
             routed = num_tokens * topk
             ne, nle = self.num_experts, self.num_local_experts
             ep, tp = self.ep_size, self.tp_size
+            counts = _phantora_moe_counts(self, num_tokens, topk, ne)
+            if counts is not None and tp > 1:
+                import warnings
+                warnings.warn("PHANTORA_MOE_ROUTING: skewed routing needs TP=1; using uniform")
+                counts = None
+            if counts is not None:
+                # Skewed routing (EP only). Every rank routes with the same per-expert
+                # counts; rank j hosts experts [j*nle, (j+1)*nle).
+                r = self.ep_group.rank()
+                mine = counts[r * nle:(r + 1) * nle]
+                dev, long = self.permute_idx_device, torch.long
+                self.num_out_tokens = routed
+                if ep > 1:
+                    self.input_splits = [sum(counts[j * nle:(j + 1) * nle]) for j in range(ep)]
+                    self.output_splits = [sum(mine)] * ep
+                    self.output_splits_tp = None
+                    self.num_global_tokens_per_local_expert = torch.tensor(
+                        [mine] * ep, dtype=long, device=dev)
+                    return torch.tensor([c * ep for c in mine], dtype=long, device="cpu")
+                self.num_global_tokens_per_local_expert = torch.tensor(counts, dtype=long, device=dev)
+                return torch.tensor(counts, dtype=long, device="cpu")
             per_expert = routed // ne  # tokens this rank sends to each expert
             dev = self.permute_idx_device
             long = torch.long
@@ -640,6 +724,26 @@ def install_phantora_gpt_oss_patches() -> None:
 
     GptOssExperts.forward = _dense_experts_forward
     GptOssExperts._phantora_dense = True
+
+
+def mark_step(step: int) -> None:
+    """Record a training-step boundary in the Phantora timeline.
+
+    Puts a zero-duration `PhantoraMarker` event with tag `step` on the current CUDA
+    stream; it lands in the timeline when the (simulated) stream reaches it, i.e.
+    after the work queued before it. Call it at the start of each iteration, and once
+    more after the loop (tag = number of iterations) to close the last step. A no-op
+    outside Phantora.
+    """
+    if os.environ.get("PHANTORA") is None:
+        return
+    lib = ctypes.CDLL("libcuda.so.1")
+    ptr = torch.cuda.current_stream().cuda_stream
+    if ptr:
+        device, sid = ctypes.cast(ptr, ctypes.POINTER(ctypes.c_int * 2)).contents
+    else:  # the default stream: Phantora maps a null stream to (current device, 0)
+        device, sid = torch.cuda.current_device(), 0
+    lib.phantora_mark(ctypes.c_int(device), ctypes.c_int(sid), ctypes.c_int64(step))
 
 
 def enable_function_tracer() -> None:

@@ -1,5 +1,6 @@
 from phantora_utils import (
     RandomTokens,
+    mark_step,
     disable_function_tracer,
     enable_function_tracer,
     install_phantora_deepspeed_patches,
@@ -201,6 +202,7 @@ def run_module(args: argparse.Namespace, model: nn.Module, rank: int) -> None:
     duras, duras_wall = [], []
     try:
         for i in range(args.iterations):
+            mark_step(i)  # step boundary in the Phantora timeline
             start, start_wall = time_pair()
             input_ids = torch.randint(
                 0, args.vocab_size, (args.micro_batch_size, args.sequence_length),
@@ -215,6 +217,7 @@ def run_module(args: argparse.Namespace, model: nn.Module, rank: int) -> None:
                 print(f"rank {rank} iter {i} time: {end - start:.2f} wall: {end_wall - start_wall:.2f}")
             duras.append(end - start)
             duras_wall.append(end_wall - start_wall)
+        mark_step(args.iterations)  # closes the last step
     finally:
         disable_function_tracer()
         dist.destroy_process_group()
@@ -282,6 +285,7 @@ def main(args: argparse.Namespace) -> None:
     duras, duras_wall = [], []
     try:
         for i in range(args.iterations):
+            mark_step(i)  # step boundary in the Phantora timeline
             start, start_wall = time_pair()
             loss = model_engine.train_batch(data_iter=data_iter)
             torch.cuda.synchronize()
@@ -290,6 +294,7 @@ def main(args: argparse.Namespace) -> None:
                 print(f"rank {rank} iter {i} loss: {float(loss.detach().cpu()):.4f} time: {end - start:.2f} wall: {end_wall - start_wall:.2f}")
             duras.append(end - start)
             duras_wall.append(end_wall - start_wall)
+        mark_step(args.iterations)  # closes the last step
     finally:
         disable_function_tracer()
         dist.destroy_process_group()

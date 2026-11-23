@@ -1,6 +1,6 @@
 use phantora::args::get_args;
 use phantora::simulator;
-use phantora::torch_call::{TorchCallJson, TorchCallMsg};
+use phantora::torch_call::{TorchCallJson, TorchCallMsg, NO_KERNEL_OPS};
 
 use cuda_call::{capi, CudaCallMsg, HostId, ResponseId};
 use serde::{Deserialize, Serialize};
@@ -97,8 +97,20 @@ fn main_loop() {
             }
             Message::Torch(callmsg, arg_device) => {
                 log::debug!("{:?}", callmsg);
-                if let Some(call) = callmsg.into_call(arg_device) {
-                    simulator.handle_torch_call(call);
+                let name = callmsg.name.clone();
+                let example = if simulator.wants_torch_example(&name) {
+                    Some(format!("{:?}", callmsg.args))
+                } else {
+                    None
+                };
+                match callmsg.into_call(arg_device) {
+                    Some(call) => {
+                        simulator.note_simulated_torch_op(&name);
+                        simulator.handle_torch_call(call);
+                    }
+                    // View/metadata ops launch no kernel: dropping them loses nothing.
+                    None if NO_KERNEL_OPS.contains(&name.as_str()) => {}
+                    None => simulator.note_dropped_torch_op(name, example),
                 }
             }
             Message::Exit(host, cur) => {
