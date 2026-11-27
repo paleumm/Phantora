@@ -50,6 +50,9 @@ Tests and tools (tests/)
     (each expert gets tokens x top_k / experts tokens), by default as a grouped-matmul
     expert layer; experts="hf_loop" reproduces stock transformers 4.56.2's per-expert
     training loop. Raises instead of computing every expert for every token.
+  - phantora_utils.py: inside a CUDA torch.autocast region, ops on autocast's
+    lower-precision list get their inputs cast as autocast casts them, so they are
+    timed at the autocast dtype and the casts are charged.
   - test_megatron.py, test_deepspeed.py, test_torchtitan.py: step markers;
     test_megatron.py --moe_routing.
   - perfdb/bench.py: Generic op timing (schema-aligned arguments, crash-isolated

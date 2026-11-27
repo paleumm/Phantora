@@ -1,6 +1,7 @@
 import ctypes
 import os
 import time as _time
+import weakref
 import torch
 from torch.profiler import (
     enable_function_tracer as _enable_function_tracer,
@@ -965,6 +966,126 @@ def enable_parameter_sharing() -> None:
 def disable_parameter_sharing() -> None:
     if os.environ.get('PHANTORA') is not None:
         torch.nn.parameter._enable_aggressive_sharing = False
+
+
+# Ops that CUDA autocast runs in its lower-precision dtype (AT_FORALL_LOWER_PRECISION_FP in
+# aten/src/ATen/autocast_mode.h of PyTorch 2.9, plus the cudnn convolutions), by the __name__ of
+# the Python callable that reaches __torch_function__ (torch.<op>, Tensor.<op>, F.<op>,
+# torch.linalg.<op> as linalg_<op>, and the @ operator).
+_AUTOCAST_LOWER_PRECISION_OPS = frozenset({
+    "_convolution", "conv1d", "conv2d", "conv3d", "conv_tbc", "conv_transpose1d",
+    "conv_transpose2d", "conv_transpose3d", "convolution", "cudnn_convolution",
+    "cudnn_convolution_transpose", "prelu", "addmm", "addmv", "addr", "matmul", "__matmul__",
+    "__rmatmul__", "einsum", "mm", "mv", "linalg_vecdot", "vecdot", "linear", "addbmm",
+    "baddbmm", "bmm", "chain_matmul", "linalg_multi_dot", "multi_dot", "_thnn_fused_lstm_cell",
+    "_thnn_fused_gru_cell", "lstm_cell", "gru_cell", "rnn_tanh_cell", "rnn_relu_cell",
+    "_scaled_dot_product_flash_attention", "scaled_dot_product_attention",
+})
+
+
+class _PhantoraAutocastMode(torch.overrides.TorchFunctionMode):
+    """Inside a CUDA autocast region, cast the inputs of autocast's lower-precision ops in Python.
+
+    The Phantora tracer records an op when the dispatcher first sees it, before the Autocast
+    dispatch key casts its inputs, so ``F.linear(x_fp32, w_fp32)`` under
+    ``torch.autocast("cuda", dtype=torch.bfloat16)`` was timed as an fp32 linear while the GPU
+    runs a bf16 one (MSH-355 F6). This mode does autocast's cast first, with the same rule as
+    ``at::autocast::cached_cast``: every floating-point CUDA tensor argument that is not float64
+    and not already the autocast dtype is cast with ``.to(dtype)``; fp32 leaves that require grad
+    (weights) are cast once per autocast region while the autocast cache is enabled. The op then
+    runs (and is recorded) with bf16/fp16 inputs and autocast finds nothing left to cast.
+
+    Effect on the timeline: the op is timed at the autocast dtype, and the casts, which autocast
+    ran inside the op where the tracer never saw them (charged nothing), are now charged as
+    ``aten::to`` kernels. Ops autocast runs in fp32 (softmax, log, norms, losses, ...) are left
+    alone: they are timed at the dtype of their inputs.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.cast_cache: dict[int, tuple["weakref.ReferenceType[torch.Tensor]", torch.Tensor]] = {}
+
+    def _cast(self, t: object, dtype: torch.dtype) -> object:
+        if not (isinstance(t, torch.Tensor) and t.is_cuda and t.is_floating_point()
+                and t.dtype not in (torch.float64, dtype)):
+            return t
+        cacheable = (t.dtype == torch.float32 and t.requires_grad and t.is_leaf
+                     and not t._is_view() and torch.is_autocast_cache_enabled())
+        if not cacheable:
+            return t.to(dtype)
+        hit = self.cast_cache.get(id(t))
+        if hit is not None and hit[0]() is t and hit[1].dtype == dtype:
+            return hit[1]
+        casted = t.to(dtype)
+        self.cast_cache[id(t)] = (weakref.ref(t), casted)
+        return casted
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        if (getattr(func, "__name__", None) in _AUTOCAST_LOWER_PRECISION_OPS
+                and torch.is_autocast_enabled("cuda")):
+            from torch.utils._pytree import tree_map
+            dtype = torch.get_autocast_dtype("cuda")
+            args, kwargs = tree_map(lambda t: self._cast(t, dtype), (tuple(args), kwargs))
+        return func(*args, **kwargs)
+
+
+_AUTOCAST_MODE: _PhantoraAutocastMode | None = None
+_AUTOCAST_DEPTH = 0
+
+
+def install_phantora_autocast_patches() -> None:
+    """Time ops under CUDA ``torch.autocast`` at the autocast dtype (MSH-355 F6).
+
+    Runs at import of this module under Phantora. Wraps ``torch.amp.autocast_mode.autocast``
+    (``torch.autocast`` and ``torch.cuda.amp.autocast``) ``__enter__``/``__exit__`` so that the
+    outermost CUDA autocast region pushes a ``_PhantoraAutocastMode`` and its exit pops it (and
+    drops the cast cache, as autocast drops its own). The mode acts only while
+    ``torch.is_autocast_enabled("cuda")``, so ``autocast(enabled=False)`` inside a region is
+    respected. Raises if the mode is not on top of the TorchFunctionMode stack at exit (another
+    mode left un-popped), rather than popping someone else's mode.
+    """
+    if os.environ.get("PHANTORA") is None:
+        return
+    from torch.amp import autocast_mode
+    cls = autocast_mode.autocast
+    if getattr(cls, "_phantora_autocast_dtype", False):
+        return
+    _orig_enter = cls.__enter__
+    _orig_exit = cls.__exit__
+
+    def __enter__(self):
+        global _AUTOCAST_MODE, _AUTOCAST_DEPTH
+        ret = _orig_enter(self)
+        if self.device == "cuda":
+            if _AUTOCAST_DEPTH == 0:
+                _AUTOCAST_MODE = _PhantoraAutocastMode()
+                _AUTOCAST_MODE.__enter__()
+            _AUTOCAST_DEPTH += 1
+        return ret
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        global _AUTOCAST_MODE, _AUTOCAST_DEPTH
+        if self.device == "cuda":
+            _AUTOCAST_DEPTH -= 1
+            if _AUTOCAST_DEPTH == 0:
+                stack = torch.overrides._get_current_function_mode_stack()
+                if not stack or stack[-1] is not _AUTOCAST_MODE:
+                    raise RuntimeError(
+                        "phantora autocast patch: leaving the outermost CUDA autocast region, but its "
+                        f"TorchFunctionMode is not on top of the mode stack ({stack}); a mode entered "
+                        "inside the autocast region was not exited before it"
+                    )
+                _AUTOCAST_MODE.__exit__(None, None, None)
+                _AUTOCAST_MODE = None
+        return _orig_exit(self, exc_type, exc_val, exc_tb)
+
+    cls.__enter__ = __enter__
+    cls.__exit__ = __exit__
+    cls._phantora_autocast_dtype = True
+
+
+install_phantora_autocast_patches()
 
 class RandomTokens(Dataset):
     def __init__(self, vocab_size, seq_len, size):
