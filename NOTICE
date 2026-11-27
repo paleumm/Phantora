@@ -32,6 +32,9 @@ Simulator (phantora/)
     stub gains the driver calls Triton's launcher needs (cuLaunchKernelEx,
     cuFuncGet/SetAttribute, cuPointerGetAttribute(s), context calls), with H100-like
     values for the device attributes Triton reads.
+  - Collective argument check: a rank joining a broadcast, all-reduce, all-gather or
+    reduce-scatter with a count, datatype or root different from the first rank's
+    stops the simulation with a message (sim.log and the ranks' stderr; ranks abort).
 
 Tests and tools (tests/)
   - phantora_utils.py: mark_step(); optional skewed MoE routing for Megatron
