@@ -726,6 +726,38 @@ def install_phantora_gpt_oss_patches() -> None:
     GptOssExperts._phantora_dense = True
 
 
+_STEP_LOG = None
+
+
+def _log_step_cpu(step: int) -> None:
+    """cluster-sim: record this process's CPU seconds at every step marker.
+
+    The simulated clock ignores CPU time, but CPU tensor work really runs here (only the GPU is
+    faked), so the CPU seconds between two markers show how much CPU work a step does (e.g. a CPU
+    optimizer step). With PHANTORA_STEP_LOG_DIR set (analysis/run_phantora.py sets it), one JSON
+    line per call goes to <dir>/cpu_<hostname>_<pid>.jsonl; without it nothing is recorded.
+    """
+    global _STEP_LOG
+    d = os.environ.get("PHANTORA_STEP_LOG_DIR")
+    if not d:
+        return
+    import json
+    import socket
+    if _STEP_LOG is None:
+        _STEP_LOG = open(os.path.join(d, f"cpu_{socket.gethostname()}_{os.getpid()}.jsonl"), "a", buffering=1)
+    _STEP_LOG.write(json.dumps({
+        "rank": int(os.environ.get("RANK", -1)), "local_rank": int(os.environ.get("LOCAL_RANK", -1)),
+        "hostname": socket.gethostname(), "pid": os.getpid(), "step": int(step),
+        "process_time_s": _time.process_time(),
+        "wall_s": _time_perf_counter_real(),
+    }) + "\n")
+
+
+def _time_perf_counter_real() -> float:
+    # phantora_utils replaces time.perf_counter with the simulated clock; keep the real one here
+    return _perf_counter() if os.environ.get("PHANTORA") is not None else _time.perf_counter()
+
+
 def mark_step(step: int) -> None:
     """Record a training-step boundary in the Phantora timeline.
 
@@ -737,6 +769,7 @@ def mark_step(step: int) -> None:
     """
     if os.environ.get("PHANTORA") is None:
         return
+    _log_step_cpu(step)
     lib = ctypes.CDLL("libcuda.so.1")
     ptr = torch.cuda.current_stream().cuda_stream
     if ptr:
