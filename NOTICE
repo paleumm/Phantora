@@ -35,6 +35,10 @@ Simulator (phantora/)
   - Collective argument check: a rank joining a broadcast, all-reduce, all-gather or
     reduce-scatter with a count, datatype or root different from the first rank's
     stops the simulation with a message (sim.log and the ranks' stderr; ranks abort).
+  - Equal-cost multipath (netsim): each flow takes one of the equal shortest paths
+    (with 2+ spines: one spine), picked by a fixed hash of (seed, source, destination,
+    size, count of earlier flows with the same three); upstream always took the first
+    spine. Seed: `ecmp_seed` in [simulator], default 0. No smarter load balancing.
 
 Tests and tools (tests/)
   - phantora_utils.py: mark_step(); optional skewed MoE routing for Megatron
