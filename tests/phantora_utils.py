@@ -688,42 +688,212 @@ def install_phantora_megatron_moe_patches() -> None:
         WrappedTorchNorm._phantora_sp_ok = True
 
 
-def install_phantora_gpt_oss_patches() -> None:
-    """Make HF gpt-oss MoE runnable under Phantora's payload-free simulation.
+# sha256 of inspect.getsource(...) for the gpt-oss methods the balanced-routing patch below
+# replaces or relies on, in transformers 4.56.2 (the version baked into phantora:latest).
+_GPT_OSS_EXPECTED_TRANSFORMERS = "4.56.2"
+_GPT_OSS_SOURCE_SHA256 = {
+    "GptOssExperts.forward": "6baacabc7811e4b4aaccd66bf16dfa4c122d51dff59632a2756829a4c9226b05",
+    "GptOssTopKRouter.forward": "0fc4e3dbb960709660c2bf7e3bb59732dd04b82c2de9a02864d33bbe56225493",
+    "GptOssMLP.forward": "295a8de8c678f3440e9d28185f4150835cf09a19cd1a2ed626a86c4f2498d4b2",
+}
+_GPT_OSS_EXPERT_ATTRS = ("num_experts", "hidden_size", "gate_up_proj", "gate_up_proj_bias",
+                         "down_proj", "down_proj_bias", "alpha", "limit")
 
-    Used by tests/test_deepspeed.py when --model gpt_oss.
 
-    gpt-oss's GptOssExperts has two paths: a training/sparse path that does
-    ``one_hot(router_indices)`` then ``.nonzero()`` to find hit experts and gathers
-    tokens per expert (all data-dependent sizes), and a dense path that computes
-    every expert for every token with FIXED shapes [num_experts, num_tokens,
-    hidden] and ignores router_indices. Under simulation the router indices are
-    garbage, so the sparse path's ``.nonzero()`` returns a garbage-sized tensor
-    (numel overflow / multi-GB balloon). Force the dense path by flipping the
-    module's ``training`` flag off just for the experts forward (autograd still
-    flows, so backward/timing are unaffected).
+class PhantoraGptOssPatchError(RuntimeError):
+    """The gpt-oss balanced-routing patch cannot be applied; the run must not continue."""
+
+
+_GPT_OSS_EXPERT_IMPLS = ("grouped", "hf_loop")
+
+
+def install_phantora_gpt_oss_patches(experts: str = "grouped") -> None:
+    """Simulate HF gpt-oss MoE with balanced top-k routing (each expert gets a fixed token share).
+
+    Used by tests/test_deepspeed.py when --model gpt_oss. Must run before the model is built.
+
+    Why: in training mode, transformers' ``GptOssExperts.forward`` (4.56.2) loops over the
+    experts the router hit: ``one_hot(router_indices)``, ``.nonzero()`` for the hit experts,
+    ``torch.where`` for each expert's tokens -- sizes that come from tensor values, which are
+    garbage under payload-free simulation. (The earlier patch switched the experts to
+    transformers' inference path, which computes every expert for every token: num_experts /
+    top_k times the real expert work, 8x for gpt-oss-20b.)
+
+    Both options fix the routing up front to perfect balance, like the Megatron MoE patch
+    above: each token goes to ``top_k`` experts, so each of the ``num_experts`` experts
+    processes exactly ``num_tokens * top_k / num_experts`` tokens. Shapes come from the input
+    shapes alone; no tensor value is read and no control flow depends on one. ``experts``
+    picks how the expert computation is expressed:
+      - ``"grouped"`` (default): a rewritten grouped-matmul expert layer, NOT stock
+        transformers. All experts at once on equal-size token groups ``[num_experts,
+        tokens_per_expert, hidden]``: gather, bmm + bias, clamp/sigmoid GLU, bmm + bias, scale
+        by the routing weight, ``index_add_`` into the output -- the way a grouped-GEMM MoE
+        kernel (MegaBlocks, ``torch._grouped_mm``) computes equal-size groups.
+      - ``"hf_loop"``: stock transformers 4.56.2's training loop, op for op: per expert,
+        gather its tokens, gate_up matmul + bias, GLU, down matmul + bias, routing weight,
+        ``index_add_``. Its backward indexes the stacked expert weights per expert, so every
+        expert produces a zero-filled gradient the size of the whole weight stack and the 32 of
+        them are summed; that is most of its cost, and it is what the stock code really does.
+    Not reproduced by either (their cost is not charged): the routing bookkeeping kernels on
+    small integer tensors (``one_hot``, ``permute``, ``sum``, ``greater``, ``nonzero``, the
+    per-expert ``torch.where``) and the host syncs they cause.
+
+    Fails loudly (``PhantoraGptOssPatchError``, never computing all experts) when the
+    precondition does not hold: transformers' gpt-oss code is missing or differs from the
+    4.56.2 source the replacement mirrors, the experts module lacks an expected attribute,
+    the routing tensors have unexpected shapes, ``num_tokens * top_k`` is not divisible by
+    ``num_experts``, or the experts run in eval mode (transformers' eval path computes every
+    expert for every token; simulating it is not supported here). An unknown ``experts``
+    value raises ``ValueError``.
     """
+    if experts not in _GPT_OSS_EXPERT_IMPLS:
+        raise ValueError(f"install_phantora_gpt_oss_patches: experts={experts!r}, expected one of "
+                         f"{_GPT_OSS_EXPERT_IMPLS}")
     if os.environ.get("PHANTORA") is None:
         return
+    import hashlib
+    import inspect
     try:
+        import transformers
         from transformers.models.gpt_oss import modeling_gpt_oss as gpt_oss
-        GptOssExperts = gpt_oss.GptOssExperts
-    except (ImportError, AttributeError):
-        return
-    if getattr(GptOssExperts, "_phantora_dense", False):
-        return
-    _orig_experts_forward = GptOssExperts.forward
+    except ImportError as e:
+        raise PhantoraGptOssPatchError(
+            "gpt-oss balanced routing: cannot import transformers.models.gpt_oss.modeling_gpt_oss "
+            f"(expected transformers {_GPT_OSS_EXPECTED_TRANSFORMERS})"
+        ) from e
+    installed = getattr(getattr(gpt_oss, "GptOssExperts", None), "_phantora_balanced", None)
+    if installed:
+        if installed != experts:
+            raise PhantoraGptOssPatchError(
+                f"gpt-oss balanced routing: already installed with experts={installed!r}, "
+                f"asked for {experts!r}"
+            )
+        return  # already installed (the sources were checked then)
+    for qualname, want in _GPT_OSS_SOURCE_SHA256.items():
+        cls_name, meth = qualname.split(".")
+        cls = getattr(gpt_oss, cls_name, None)
+        if cls is None or not hasattr(cls, meth):
+            raise PhantoraGptOssPatchError(
+                f"gpt-oss balanced routing: transformers.models.gpt_oss.modeling_gpt_oss.{qualname} not "
+                f"found (expected transformers {_GPT_OSS_EXPECTED_TRANSFORMERS}, found "
+                f"{transformers.__version__})"
+            )
+        got = hashlib.sha256(inspect.getsource(getattr(cls, meth)).encode()).hexdigest()
+        if got != want:
+            raise PhantoraGptOssPatchError(
+                f"gpt-oss balanced routing: source of {qualname} differs from transformers "
+                f"{_GPT_OSS_EXPECTED_TRANSFORMERS}, which the replacement mirrors (sha256 {got}, expected "
+                f"{want}; installed transformers {transformers.__version__}). Re-check the expert loop "
+                f"and update phantora_utils.install_phantora_gpt_oss_patches."
+            )
+    GptOssExperts = gpt_oss.GptOssExperts
 
-    def _dense_experts_forward(self, hidden_states, router_indices=None, routing_weights=None):
-        was_training = self.training
-        self.training = False  # select the fixed-shape dense expert path
-        try:
-            return _orig_experts_forward(self, hidden_states, router_indices, routing_weights)
-        finally:
-            self.training = was_training
+    def _balanced_experts_forward(
+        self: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        router_indices: torch.Tensor | None = None,
+        routing_weights: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        missing = [a for a in _GPT_OSS_EXPERT_ATTRS if not hasattr(self, a)]
+        if missing:
+            raise PhantoraGptOssPatchError(
+                f"gpt-oss balanced routing: GptOssExperts has no attribute(s) {missing}"
+            )
+        if not self.training:
+            raise PhantoraGptOssPatchError(
+                "gpt-oss balanced routing: GptOssExperts.forward called in eval mode. transformers' "
+                "eval path computes every expert for every token; only training (balanced top-k "
+                "routing) is simulated."
+            )
+        if router_indices is None or routing_weights is None:
+            raise PhantoraGptOssPatchError(
+                "gpt-oss balanced routing: GptOssExperts.forward needs router_indices and "
+                "routing_weights (as GptOssMLP.forward passes them)"
+            )
+        num_experts: int = self.num_experts
+        hidden: int = self.hidden_size
+        batch_size = hidden_states.shape[0]
+        if hidden_states.shape[-1] != hidden or hidden_states.numel() % hidden != 0:
+            raise PhantoraGptOssPatchError(
+                f"gpt-oss balanced routing: hidden_states shape {tuple(hidden_states.shape)}, expected "
+                f"(..., {hidden})"
+            )
+        num_tokens = hidden_states.numel() // hidden
+        if router_indices.dim() != 2 or router_indices.shape[0] != num_tokens:
+            raise PhantoraGptOssPatchError(
+                f"gpt-oss balanced routing: router_indices shape {tuple(router_indices.shape)}, expected "
+                f"({num_tokens}, top_k)"
+            )
+        top_k = router_indices.shape[1]
+        if not 1 <= top_k <= num_experts:
+            raise PhantoraGptOssPatchError(
+                f"gpt-oss balanced routing: top_k={top_k} outside [1, num_experts={num_experts}]"
+            )
+        if tuple(routing_weights.shape) != (num_tokens, num_experts):
+            raise PhantoraGptOssPatchError(
+                f"gpt-oss balanced routing: routing_weights shape {tuple(routing_weights.shape)}, "
+                f"expected ({num_tokens}, {num_experts})"
+            )
+        if (num_tokens * top_k) % num_experts != 0:
+            raise PhantoraGptOssPatchError(
+                f"gpt-oss balanced routing: num_tokens*top_k = {num_tokens}*{top_k} is not divisible "
+                f"by num_experts={num_experts}, so experts cannot get equal token shares"
+            )
+        per_expert = num_tokens * top_k // num_experts
 
-    GptOssExperts.forward = _dense_experts_forward
-    GptOssExperts._phantora_dense = True
+        hidden_states = hidden_states.reshape(-1, hidden)  # (num_tokens, hidden)
+        if experts == "grouped":
+            return _grouped_experts(self, hidden_states, routing_weights, batch_size, per_expert)
+        next_states = torch.zeros_like(hidden_states, dtype=hidden_states.dtype, device=hidden_states.device)
+        # One index tensor of the right length, shared by all experts. Its contents are
+        # never read on the host and the gather/scatter kernels never run, so only its
+        # shape matters (same approach as the Megatron permute patch above).
+        token_idx = torch.empty(per_expert, dtype=torch.long, device=hidden_states.device)
+        for expert_idx in range(num_experts):
+            # Body copied from transformers 4.56.2 GptOssExperts.forward (training path).
+            current_state = hidden_states[token_idx]
+            gate_up = current_state @ self.gate_up_proj[expert_idx] + self.gate_up_proj_bias[expert_idx]
+            gate, up = gate_up[..., ::2], gate_up[..., 1::2]
+            gate = gate.clamp(min=None, max=self.limit)
+            up = up.clamp(min=-self.limit, max=self.limit)
+            glu = gate * torch.sigmoid(gate * self.alpha)
+            gated_output = (up + 1) * glu
+            out = gated_output @ self.down_proj[expert_idx] + self.down_proj_bias[expert_idx]
+            weighted_output = out * routing_weights[token_idx, expert_idx, None]
+            next_states.index_add_(0, token_idx, weighted_output.to(hidden_states.dtype))
+        return next_states.view(batch_size, -1, hidden)
+
+    def _grouped_experts(
+        self: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        routing_weights: torch.Tensor,
+        batch_size: int,
+        per_expert: int,
+    ) -> torch.Tensor:
+        # All experts at once on equal-size token groups: [E, per_expert, hidden]. Index
+        # contents are irrelevant under simulation (only shapes are), as in the loop above.
+        num_experts: int = self.num_experts
+        hidden: int = self.hidden_size
+        dev = hidden_states.device
+        routed = num_experts * per_expert  # == num_tokens * top_k
+        token_idx = torch.empty(routed, dtype=torch.long, device=dev)
+        expert_ids = torch.empty(routed, dtype=torch.long, device=dev)
+        current_state = hidden_states[token_idx].view(num_experts, per_expert, hidden)
+        gate_up = torch.bmm(current_state, self.gate_up_proj) + self.gate_up_proj_bias[..., None, :]
+        gate, up = gate_up[..., ::2], gate_up[..., 1::2]
+        gate = gate.clamp(min=None, max=self.limit)
+        up = up.clamp(min=-self.limit, max=self.limit)
+        glu = gate * torch.sigmoid(gate * self.alpha)
+        out = torch.bmm(((up + 1) * glu), self.down_proj) + self.down_proj_bias[..., None, :]
+        weights = routing_weights[token_idx, expert_ids].view(num_experts, per_expert, 1)
+        weighted_output = (out * weights).view(routed, hidden)
+        next_states = torch.zeros_like(hidden_states)
+        next_states.index_add_(0, token_idx, weighted_output.to(hidden_states.dtype))
+        return next_states.view(batch_size, -1, hidden)
+
+    GptOssExperts._phantora_orig_forward = GptOssExperts.forward
+    GptOssExperts.forward = _balanced_experts_forward
+    GptOssExperts._phantora_balanced = experts
 
 
 _STEP_LOG = None
