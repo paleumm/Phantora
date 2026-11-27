@@ -2,6 +2,10 @@
 #include "phantora.h"
 #include <cuda_runtime_api.h>
 #include <dlfcn.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <stdatomic.h>
 #include <string.h>
 #include <sys/types.h>
@@ -200,6 +204,60 @@ cudaPeekAtLastError(void)
 static const size_t MEM_ALIGNMENT_MASK = 0xFF;
 static atomic_uintptr_t MEM_LIMIT = MEM_ALIGNMENT_MASK + 1;
 
+// Which device each cudaMalloc range belongs to, so a copy between two GPUs of one process can be
+// refused (see cudaMemcpyAsync). Addresses come from the bump pointer MEM_LIMIT and are never
+// reused, so ranges are appended in increasing order and never removed.
+struct alloc_range
+{
+    uintptr_t start;
+    uintptr_t end;
+    int device;
+};
+static struct alloc_range* ALLOC_RANGES = NULL;
+static size_t ALLOC_RANGES_LEN = 0;
+static size_t ALLOC_RANGES_CAP = 0;
+static pthread_mutex_t ALLOC_RANGES_LOCK = PTHREAD_MUTEX_INITIALIZER;
+
+static void
+_record_alloc_range(uintptr_t start, size_t size, int device)
+{
+    pthread_mutex_lock(&ALLOC_RANGES_LOCK);
+    if (ALLOC_RANGES_LEN == ALLOC_RANGES_CAP) {
+        size_t cap = ALLOC_RANGES_CAP ? 2 * ALLOC_RANGES_CAP : 1024;
+        struct alloc_range* grown = realloc(ALLOC_RANGES, cap * sizeof(struct alloc_range));
+        if (!grown) {
+            fprintf(stderr, "PHANTORA: out of host memory recording a device allocation\n");
+            exit(1);
+        }
+        ALLOC_RANGES = grown;
+        ALLOC_RANGES_CAP = cap;
+    }
+    ALLOC_RANGES[ALLOC_RANGES_LEN++] = (struct alloc_range){ start, start + size, device };
+    pthread_mutex_unlock(&ALLOC_RANGES_LOCK);
+}
+
+// Device owning `addr`, or -1 when it is not inside any cudaMalloc range (host memory).
+static int
+_device_of(uintptr_t addr)
+{
+    int device = -1;
+    pthread_mutex_lock(&ALLOC_RANGES_LOCK);
+    size_t lo = 0, hi = ALLOC_RANGES_LEN;
+    while (lo < hi) { // first range whose start is > addr
+        size_t mid = lo + (hi - lo) / 2;
+        if (ALLOC_RANGES[mid].start <= addr) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if (lo > 0 && addr < ALLOC_RANGES[lo - 1].end) {
+        device = ALLOC_RANGES[lo - 1].device;
+    }
+    pthread_mutex_unlock(&ALLOC_RANGES_LOCK);
+    return device;
+}
+
 cudaError_t
 cudaMalloc(void** devPtr, size_t size)
 {
@@ -213,6 +271,7 @@ cudaMalloc(void** devPtr, size_t size)
     if (cuda_register_malloc(
           _get_current_device(), MEM_LIMIT, aligned_size, total_mem)) {
         *devPtr = (void*)MEM_LIMIT;
+        _record_alloc_range(MEM_LIMIT, aligned_size, _get_current_device());
         MEM_LIMIT += aligned_size;
         return cudaSuccess;
     } else {
@@ -252,6 +311,21 @@ cudaMemcpyAsync(void* dst,
                 cudaStream_t stream)
 {
     struct phantora_cudaStream stream_ = phantora_cudaStream(stream);
+    // A copy between two GPUs of one process (e.g. torch `t.to("cuda:1")` from cuda:0) would be
+    // timed as a copy inside one GPU, with no NVLink/PCIe or network flow. Refuse it instead of
+    // simulating it wrongly; GPU-to-GPU traffic must go through NCCL.
+    if (kind == cudaMemcpyDeviceToDevice || kind == cudaMemcpyDefault) {
+        int src_device = _device_of((uintptr_t)src);
+        int dst_device = _device_of((uintptr_t)dst);
+        if (src_device >= 0 && dst_device >= 0 && src_device != dst_device) {
+            fprintf(stderr,
+                    "PHANTORA: copy of %zu bytes from GPU %d to GPU %d inside one process is not "
+                    "simulated (it would be timed as a copy inside one GPU, with no link between "
+                    "the GPUs). Send GPU-to-GPU data with NCCL.\n",
+                    count, src_device, dst_device);
+            exit(1);
+        }
+    }
     cuda_memcpy_async(
       (uintptr_t)src, (uintptr_t)dst, count, kind, stream_.device, stream_.id);
     // may crash things
