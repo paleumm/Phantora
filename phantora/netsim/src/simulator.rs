@@ -13,7 +13,7 @@ use thiserror::Error;
 use crate::{
     app::{AppEvent, AppEventKind, Application, Replayer},
     bandwidth::{self, Bandwidth, BandwidthTrait},
-    cluster::{Cluster, Link, LinkIx, Route, RouteHint, Topology},
+    cluster::{fnv1a, splitmix64, Cluster, Link, LinkIx, Route, RouteHint, Topology},
     timer::{OnceTimer, Timer, TimerKind},
 };
 use crate::{
@@ -49,6 +49,10 @@ pub struct SimulatorSetting {
     #[serde(deserialize_with = "deserialize_bandwidth")]
     pub loopback_speed: Bandwidth,
     pub fairness: FairnessModel,
+    /// Seed of the equal-cost multipath choice (see `EcmpRouting`); `ecmp_seed` in
+    /// the netconfig's [simulator] table, default 0.
+    #[serde(default)]
+    pub ecmp_seed: u64,
 }
 
 impl Default for SimulatorSetting {
@@ -56,8 +60,53 @@ impl Default for SimulatorSetting {
         Self {
             fairness: FairnessModel::default(),
             loopback_speed: LOOPBACK_SPEED_GBPS.gbps(),
+            ecmp_seed: 0,
         }
     }
+}
+
+/// Picks, for each flow, one of the equal shortest paths between its two hosts, at
+/// random but reproducibly: the path hash is a fixed function (SplitMix64 / FNV-1a,
+/// no std hasher, no RNG state) of
+///   (seed, source host, destination host, flow size in bytes, n),
+/// where n is how many earlier flows of this simulation had the same source,
+/// destination and size. It does not depend on wall-clock arrival order, on the
+/// flow's global id, or on simulated time; the only order it depends on is the order
+/// in which flows of identical (source, destination, size) are added, and those are
+/// interchangeable. Hosts are the network's names (`host_<i>`, after host mapping).
+#[derive(Debug, Default)]
+pub struct EcmpRouting {
+    seed: u64,
+    seen: FnvHashMap<(String, String, usize), u64>,
+}
+
+impl EcmpRouting {
+    pub fn new(seed: u64) -> Self {
+        EcmpRouting {
+            seed,
+            seen: FnvHashMap::default(),
+        }
+    }
+
+    /// The path hash of the next flow from `src` to `dst` of `bytes` bytes.
+    pub fn next_path_hash(&mut self, src: &str, dst: &str, bytes: usize) -> u64 {
+        let n = self
+            .seen
+            .entry((src.to_owned(), dst.to_owned(), bytes))
+            .or_insert(0);
+        let h = ecmp_path_hash(self.seed, src, dst, bytes, *n);
+        *n += 1;
+        h
+    }
+}
+
+/// The path hash of the `n`-th flow (from 0) from `src` to `dst` of `bytes` bytes.
+pub fn ecmp_path_hash(seed: u64, src: &str, dst: &str, bytes: usize, n: u64) -> u64 {
+    let mut h = splitmix64(seed);
+    h = splitmix64(h ^ fnv1a(src));
+    h = splitmix64(h ^ fnv1a(dst));
+    h = splitmix64(h ^ bytes as u64);
+    splitmix64(h ^ n)
 }
 
 fn serialize_bandwidth<S>(bw: &Bandwidth, se: S) -> Result<S::Ok, S::Error>
@@ -146,7 +195,10 @@ impl SimulatorBuilder {
         Ok(Simulator {
             cluster: self.cluster.take().unwrap(),
             ts: 0,
-            state: NetState::default(),
+            state: NetState {
+                ecmp: EcmpRouting::new(self.setting.ecmp_seed),
+                ..NetState::default()
+            },
             timers: BinaryHeap::<Box<dyn Timer>>::new(),
             setting: self.setting,
             host_mapping: self.host_mapping.take(),
@@ -774,6 +826,8 @@ use priority_queue::PriorityQueue;
 struct NetState {
     resolve_route_time: time::Duration,
     fairness: FairnessModel,
+    /// Which of the equal shortest paths each new flow takes.
+    ecmp: EcmpRouting,
 
     /// buffered flows, flow.ts > sim.ts
     flow_bufs: PriorityQueue<Flow, Reverse<FlowStateRef>>,
@@ -935,13 +989,34 @@ impl NetState {
             // only the physical cluster is what we have, no virtualization
             let hint = RouteHint::VirtAddr(r.flow.vsrc.as_deref(), r.flow.vdst.as_deref());
             let max_rate = bandwidth::MAX;
+            let path_hash = self
+                .ecmp
+                .next_path_hash(&r.flow.src, &r.flow.dst, r.flow.bytes);
             (
                 max_rate,
-                cluster.resolve_route(&r.flow.src, &r.flow.dst, &hint),
+                cluster.resolve_route_ecmp(&r.flow.src, &r.flow.dst, &hint, Some(path_hash)),
             )
         };
 
         self.resolve_route_time += start.elapsed();
+        // Off by default; PHANTORA_LOG=info,netsim::ecmp=debug lists each flow's top switch.
+        if log::log_enabled!(target: "netsim::ecmp", log::Level::Debug) {
+            let top = route
+                .path
+                .iter()
+                .map(|&l| cluster.get_target(l))
+                .min_by_key(|&n| cluster[n].depth)
+                .map_or("-", |n| cluster[n].name.as_str());
+            log::debug!(
+                target: "netsim::ecmp",
+                "flow {}->{} {} B start {} ns via {}",
+                r.flow.src,
+                r.flow.dst,
+                r.flow.bytes,
+                r.ts,
+                top
+            );
+        }
         self.push_flow(FlowState::new(r.ts, r.flow, max_rate, route), sim_ts);
     }
 
@@ -1209,5 +1284,125 @@ impl std::iter::FromIterator<Event> for Events {
 impl From<Event> for Events {
     fn from(e: Event) -> Self {
         Events(smallvec![e])
+    }
+}
+
+#[cfg(test)]
+mod ecmp_tests {
+    use super::{ecmp_path_hash, EcmpRouting};
+    use crate::architecture::build_twolayer_multipath_cluster;
+    use crate::bandwidth::BandwidthTrait;
+    use crate::cluster::{Cluster, Route, RouteHint, Topology};
+
+    const NO_HINT: RouteHint<'static> = RouteHint::VirtAddr(None, None);
+
+    fn cluster(nspines: usize, nracks: usize) -> Cluster {
+        build_twolayer_multipath_cluster(nspines, nracks, 2, 100.gbps(), 100.gbps())
+    }
+
+    fn names(c: &Cluster, r: &Route) -> Vec<String> {
+        let mut v = vec![c[r.from].name.clone()];
+        v.extend(r.path.iter().map(|&l| c[c.get_target(l)].name.clone()));
+        v
+    }
+
+    /// The spine a route crosses, checking it is a valid shortest path on the way.
+    fn spine_of(c: &Cluster, r: &Route) -> Option<String> {
+        for w in r.path.windows(2) {
+            assert_eq!(c.get_target(w[0]), c.get_source(w[1]), "route is not a chain");
+        }
+        assert_eq!(c.get_source(r.path[0]), r.from);
+        assert_eq!(c.get_target(*r.path.last().unwrap()), r.to);
+        let ns = names(c, r);
+        let spines: Vec<_> = ns.iter().filter(|n| n.starts_with("spine_")).cloned().collect();
+        assert!(spines.len() <= 1, "more than one spine on {:?}", ns);
+        assert!(r.path.len() <= 4, "not a shortest path: {:?}", ns);
+        spines.into_iter().next()
+    }
+
+    #[test]
+    fn spreads_evenly_over_spines() {
+        for nspines in [2usize, 4] {
+            let c = cluster(nspines, 4);
+            let mut ecmp = EcmpRouting::new(0);
+            let mut counts = vec![0usize; nspines];
+            let n = 20_000;
+            for i in 0..n {
+                // a mix of repeated sizes and pairs, as a training step produces
+                let (src, dst) = [("host_0", "host_2"), ("host_3", "host_6"), ("host_7", "host_1")][i % 3];
+                let bytes = [1 << 20, 4 << 20, 123_456][i % 7 % 3];
+                let h = ecmp.next_path_hash(src, dst, bytes);
+                let r = c.resolve_route_ecmp(src, dst, &NO_HINT, Some(h));
+                let s = spine_of(&c, &r).expect("racks differ: must cross a spine");
+                counts[s.trim_start_matches("spine_").parse::<usize>().unwrap()] += 1;
+            }
+            let expect = n as f64 / nspines as f64;
+            for (k, &cnt) in counts.iter().enumerate() {
+                // binomial sd at n=20000 is <= 71 flows; allow 5% of the mean
+                assert!(
+                    (cnt as f64 - expect).abs() < 0.05 * expect,
+                    "{nspines} spines: spine {k} got {cnt} of {n} flows ({counts:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn same_inputs_same_routes() {
+        let c = cluster(2, 4);
+        let run = |seed: u64| -> Vec<Vec<String>> {
+            let mut ecmp = EcmpRouting::new(seed);
+            (0..200)
+                .map(|i| {
+                    let bytes = 1000 * (i % 5 + 1);
+                    let h = ecmp.next_path_hash("host_1", "host_5", bytes);
+                    names(&c, &c.resolve_route_ecmp("host_1", "host_5", &NO_HINT, Some(h)))
+                })
+                .collect()
+        };
+        assert_eq!(run(0), run(0));
+        assert_eq!(run(7), run(7));
+        assert_ne!(run(0), run(7), "the seed changes the choice");
+        // The hash is a fixed function of its inputs (no hidden state)...
+        assert_eq!(
+            ecmp_path_hash(0, "host_1", "host_5", 4096, 3),
+            ecmp_path_hash(0, "host_1", "host_5", 4096, 3)
+        );
+        // ...and the n-th flow of one (src, dst, size) does not depend on flows of other
+        // sizes or pairs added in between.
+        let mut a = EcmpRouting::new(0);
+        let mut b = EcmpRouting::new(0);
+        let a0 = a.next_path_hash("host_0", "host_2", 64);
+        b.next_path_hash("host_0", "host_2", 128);
+        b.next_path_hash("host_4", "host_2", 64);
+        assert_eq!(a0, b.next_path_hash("host_0", "host_2", 64));
+        assert_eq!(a.next_path_hash("host_0", "host_2", 64), b.next_path_hash("host_0", "host_2", 64));
+    }
+
+    #[test]
+    fn single_shortest_path_is_unchanged() {
+        // one spine: every hash gives the old (first-parent) route
+        let one = cluster(1, 4);
+        // two spines but both hosts in one rack: the route turns at the rack switch
+        let two = cluster(2, 4);
+        for h in (0..500u64).map(|i| i.wrapping_mul(0x9e37_79b9_7f4a_7c15)) {
+            for (src, dst) in [("host_0", "host_2"), ("host_5", "host_1"), ("host_6", "host_6")] {
+                assert_eq!(
+                    one.resolve_route_ecmp(src, dst, &NO_HINT, Some(h)).path,
+                    one.resolve_route(src, dst, &NO_HINT).path
+                );
+            }
+            for (src, dst) in [("host_0", "host_1"), ("host_7", "host_6"), ("host_3", "host_3")] {
+                let r = two.resolve_route_ecmp(src, dst, &NO_HINT, Some(h));
+                assert_eq!(r.path, two.resolve_route(src, dst, &NO_HINT).path);
+                if src != dst {
+                    assert_eq!(spine_of(&two, &r), None);
+                }
+            }
+        }
+        // no hash: the old route, on the first spine
+        let r = two.resolve_route_ecmp("host_0", "host_2", &NO_HINT, None);
+        assert_eq!(r.path, two.resolve_route("host_0", "host_2", &NO_HINT).path);
+        assert_eq!(spine_of(&two, &r).as_deref(), Some("spine_0"));
     }
 }

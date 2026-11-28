@@ -44,6 +44,9 @@ pub trait Topology:
     fn all_links(&self) -> EdgeIndices;
     fn find_link(&self, ix: NodeIx, iy: NodeIx) -> Option<LinkIx>;
     fn resolve_route(&self, src: &str, dst: &str, hint: &RouteHint) -> Route;
+    /// `resolve_route` over one of the equal shortest paths, chosen by `path_hash`
+    /// (`None`: always the first parent, i.e. `resolve_route`).
+    fn resolve_route_ecmp(&self, src: &str, dst: &str, hint: &RouteHint, path_hash: Option<u64>) -> Route;
     fn num_hosts(&self) -> usize;
     fn num_switches(&self) -> usize;
     fn num_racks(&self) -> usize;
@@ -376,6 +379,28 @@ impl Topology for Cluster {
     /// When psrc == pdst && vsrc != vdst, the flow is inter-VM but the VM colocates, let the flow goes througth the access port of the switch.
     /// Otherwise, resolve the route as normal.
     fn resolve_route(&self, src: &str, dst: &str, hint: &RouteHint) -> Route {
+        // No path hash: always the first parent, as before.
+        self.resolve_route_ecmp(src, dst, hint, None)
+    }
+
+    /// Route from `src` to `dst` over one of the equal shortest paths, chosen by
+    /// `path_hash`. The route climbs from both ends towards the lowest common switch
+    /// layer, one layer per step. At each step the next hop is one of the switches
+    /// that both ends can reach as a parent (for a two-layer network: any spine, when
+    /// the two racks differ), picked with `ecmp_pick(path_hash, level, n)`; the
+    /// destination side then takes its link to that same switch. When there is one
+    /// such switch, or none (the two ends meet higher up), both ends take their first
+    /// parent as before. So with one shortest path (one spine, or both hosts in one
+    /// rack) the route is exactly the old one, and `path_hash: None` gives the old
+    /// route everywhere. Limitation: no smarter load balancing than a per-flow random
+    /// choice among equal shortest paths (no congestion awareness, no flow splitting).
+    fn resolve_route_ecmp(
+        &self,
+        src: &str,
+        dst: &str,
+        hint: &RouteHint,
+        path_hash: Option<u64>,
+    ) -> Route {
         let g = &self.graph;
 
         log::debug!("searching route from {} to {}", src, dst);
@@ -412,8 +437,22 @@ impl Topology for Cluster {
         let mut x = src_id;
         let mut y = dst_id;
         while x != y && depth > 1 {
-            let parx = g[x].parent[0];
-            let pary = g[y].parent[0];
+            // Parents of x whose switch is also a parent of y: the equal next hops.
+            let common: Vec<(LinkIx, LinkIx)> = g[x]
+                .parent
+                .iter()
+                .filter_map(|&px| {
+                    let tx = g.raw_edges()[px.index()].target();
+                    g[y].parent
+                        .iter()
+                        .find(|&&py| g.raw_edges()[py.index()].target() == tx)
+                        .map(|&py| (px, py))
+                })
+                .collect();
+            let (parx, pary) = match path_hash {
+                Some(h) if common.len() > 1 => common[ecmp_pick(h, depth, common.len())],
+                _ => (g[x].parent[0], g[y].parent[0]),
+            };
             x = g.raw_edges()[parx.index()].target();
             y = g.raw_edges()[pary.index()].target();
             depth -= 1;
@@ -454,6 +493,38 @@ impl Topology for Cluster {
     fn to_dot(&self) -> Dot<'_, &Graph<Node, Link>> {
         Dot::with_config(&self.graph, &[])
     }
+}
+
+/// Equal-cost multipath: which of `n` equal next hops a flow takes at switch layer
+/// `level` (the depth of the node it leaves), given the flow's path hash.
+#[inline]
+pub fn ecmp_pick(path_hash: u64, level: usize, n: usize) -> usize {
+    assert!(n > 0, "ecmp_pick: no next hop");
+    if n == 1 {
+        return 0;
+    }
+    (splitmix64(path_hash ^ (level as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)) % n as u64) as usize
+}
+
+/// SplitMix64 finalizer: a fixed, portable 64-bit mix (unlike std's DefaultHasher,
+/// whose algorithm may change between Rust releases).
+#[inline]
+pub fn splitmix64(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+/// FNV-1a over a string: fixed and portable.
+#[inline]
+pub fn fnv1a(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
