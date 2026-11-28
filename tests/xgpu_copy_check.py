@@ -1,5 +1,5 @@
 # xgpu_copy_check: test of the CUDA stand-in's refusal of GPU-to-GPU copies inside one process
-# (patch 0007). Such a copy (torch `t.to("cuda:1")` from cuda:0) would otherwise be timed as a copy
+# (stub/cudart.c, cudaMemcpyAsync). Such a copy (torch `t.to("cuda:1")` from cuda:0) would otherwise be timed as a copy
 # inside one GPU, with no link between the GPUs. Run on one server with 2 GPUs:
 #
 #   --case nccl        every rank all-reduces on its own GPU. Must run to the end.
@@ -8,6 +8,10 @@
 #   --case to_other    as nccl, plus rank 0 copies a tensor from its GPU to the next GPU with
 #                      `t.to(...)`. Must stop with "PHANTORA: copy of ... from GPU 0 to GPU 1".
 #   --case copy_other  the same with `dst.copy_(src)` between preallocated tensors on two GPUs.
+#   --case to_other_cast     the same with `t.to(other, dtype=float32)`: a copy that also casts.
+#   --case to_other_strided  the same with a transposed (not contiguous) tensor.
+#                      With peer access PyTorch would do these two as a kernel on one GPU; the stub
+#                      reports none, so they also reach cudaMemcpyAsync and must stop the same way.
 #
 # Follows scripts/README.md (tracer, mark_step, mock data, no control flow on values).
 import sys
@@ -20,7 +24,7 @@ import os
 import torch
 import torch.distributed as dist
 
-CASES = ["nccl", "same_gpu", "to_other", "copy_other"]
+CASES = ["nccl", "same_gpu", "to_other", "copy_other", "to_other_cast", "to_other_strided"]
 
 
 def main() -> None:
@@ -60,6 +64,10 @@ def main() -> None:
                 src.to(other)
             elif a.case == "copy_other":
                 other_dst.copy_(src)
+            elif a.case == "to_other_cast":
+                src.to(other, dtype=torch.float32)
+            elif a.case == "to_other_strided":
+                src.view(-1, 1000).t().to(other)
         torch.cuda.synchronize()
         end, _ = time_pair()
         duras.append(end - start)

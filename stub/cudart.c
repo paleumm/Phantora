@@ -587,7 +587,11 @@ cudaEventQuery(cudaEvent_t event)
 cudaError_t
 cudaDeviceCanAccessPeer(int* canAccessPeer, int device, int peerDevice)
 {
-    *canAccessPeer = 1;
+    // No peer access. With it, PyTorch copies between GPUs that also cast or are not contiguous
+    // with a kernel on one GPU, which the simulator times as an op inside that GPU. Without it,
+    // PyTorch stages such copies so the transfer between GPUs is a cudaMemcpyAsync, which
+    // cudaMemcpyAsync refuses.
+    *canAccessPeer = 0;
     return cudaSuccess;
 }
 
