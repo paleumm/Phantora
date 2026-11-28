@@ -209,6 +209,150 @@ struct CCWaiting {
     comm_barrier: EventId,
     joined_ranks: HashSet<i32>,
     waiting_for: HashSet<i32>,
+    // The rank that opened this collective and the arguments it passed. `trace` was
+    // computed from these alone, so every later rank must pass the same ones.
+    first_rank: i32,
+    first_args: CollectiveArgs,
+}
+
+/// What NCCL requires every rank of one collective to pass identically: the element
+/// count and datatype (hence the bytes), and for a broadcast the root. NCCL's count is
+/// already the per-rank one where send and receive sizes differ: all-gather takes the
+/// send count, reduce-scatter the receive count, so these agree across ranks in a
+/// correct program too. Point-to-point send/recv does not come through here (its sizes
+/// legitimately differ per peer pair; each send is matched with its receive instead).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CollectiveArgs {
+    op: &'static str,
+    count_name: &'static str,
+    count: usize,
+    dtype: NcclDatatype,
+    root: Option<i32>,
+}
+
+impl CollectiveArgs {
+    fn of(call: &CudaCall) -> CollectiveArgs {
+        match *call {
+            CudaCall::NcclBcast {
+                count, dtype, root, ..
+            } => CollectiveArgs {
+                op: "broadcast (ncclBcast)",
+                count_name: "count",
+                count,
+                dtype,
+                root: Some(root),
+            },
+            CudaCall::NcclAllReduce { count, dtype, .. } => CollectiveArgs {
+                op: "all-reduce (ncclAllReduce)",
+                count_name: "count",
+                count,
+                dtype,
+                root: None,
+            },
+            CudaCall::NcclAllGather { count, dtype, .. } => CollectiveArgs {
+                op: "all-gather (ncclAllGather)",
+                count_name: "send count",
+                count,
+                dtype,
+                root: None,
+            },
+            CudaCall::NcclReduceScatter { count, dtype, .. } => CollectiveArgs {
+                op: "reduce-scatter (ncclReduceScatter)",
+                count_name: "receive count",
+                count,
+                dtype,
+                root: None,
+            },
+            _ => panic!("CollectiveArgs::of: not a collective: {:?}", call),
+        }
+    }
+
+    fn describe(&self) -> String {
+        let mut s = format!(
+            "{} {} of {:?} ({} bytes)",
+            self.count_name,
+            self.count,
+            self.dtype,
+            self.count * self.dtype.size()
+        );
+        if let Some(root) = self.root {
+            s += &format!(", root {root}");
+        }
+        s
+    }
+}
+
+/// A rank joined a collective with different arguments than the rank that opened it.
+/// The simulator sizes a collective's flows from the opening rank only, so the result
+/// would depend on which rank happened to call first (it changes from step to step);
+/// the run cannot continue. Real NCCL would hang or corrupt memory here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectiveMismatch {
+    op: &'static str,
+    comm: String,
+    nranks: usize,
+    first: (i32, String, String),
+    joining: (i32, String, String),
+}
+
+impl std::fmt::Display for CollectiveMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "collective mismatch: {op} on communicator {comm} ({n} ranks): rank {r0} ({h0}) \
+             called it with {a0}, but rank {r1} ({h1}) joined it with {a1}. Every rank of a \
+             collective must pass the same count and datatype (and root, for a broadcast); \
+             real NCCL would hang or corrupt memory. The simulation stops here because its \
+             result would depend on which rank called first.",
+            op = self.op,
+            comm = self.comm,
+            n = self.nranks,
+            r0 = self.first.0,
+            h0 = self.first.1,
+            a0 = self.first.2,
+            r1 = self.joining.0,
+            h1 = self.joining.1,
+            a1 = self.joining.2,
+        )
+    }
+}
+
+impl std::error::Error for CollectiveMismatch {}
+
+/// Communicator label for messages: the simulator hands out ids by incrementing a
+/// 128-byte little-endian counter (`incr_nccl_id`), so the low 8 bytes number them.
+fn comm_label(id: &[u8; 128]) -> String {
+    let mut low = [0u8; 8];
+    low.copy_from_slice(&id[..8]);
+    format!("#{}", u64::from_le_bytes(low))
+}
+
+fn rank_label(ranks: &[(HostId, i32)], rank: i32) -> String {
+    match ranks.get(rank as usize) {
+        Some((host, device)) => format!("{} GPU {} pid {}", host.hostname, device, host.pid),
+        None => "unknown host".to_owned(),
+    }
+}
+
+/// The F14 check: compare a joining rank's arguments with the opening rank's.
+fn check_collective_join(
+    ranks: &[(HostId, i32)],
+    comm_id: &[u8; 128],
+    first_rank: i32,
+    first: &CollectiveArgs,
+    joining_rank: i32,
+    joining: &CollectiveArgs,
+) -> Result<(), CollectiveMismatch> {
+    if first == joining {
+        return Ok(());
+    }
+    Err(CollectiveMismatch {
+        op: first.op,
+        comm: comm_label(comm_id),
+        nranks: ranks.len(),
+        first: (first_rank, rank_label(ranks, first_rank), first.describe()),
+        joining: (joining_rank, rank_label(ranks, joining_rank), joining.describe()),
+    })
 }
 
 pub struct Simulator {
@@ -674,7 +818,9 @@ impl Simulator {
         }
     }
 
-    pub fn handle_cuda_call(&mut self, msg: CudaCallMsg) {
+    /// Errors only when the program breaks a rule the simulation cannot continue past
+    /// (a collective joined with mismatched arguments); the caller should stop.
+    pub fn handle_cuda_call(&mut self, msg: CudaCallMsg) -> Result<(), CollectiveMismatch> {
         let host = msg.id;
         let curr_time = msg.curr_time;
 
@@ -699,7 +845,7 @@ impl Simulator {
                     $comm,
                     $stream,
                     call,
-                )
+                )?
             }};
         }
 
@@ -786,7 +932,7 @@ impl Simulator {
                 root,
                 comm,
                 stream,
-            } => self.nccl_bcast(host, curr_time, count, dtype, root, comm, stream, call),
+            } => self.nccl_bcast(host, curr_time, count, dtype, root, comm, stream, call)?,
             CudaCall::NcclAllReduce {
                 count,
                 dtype,
@@ -834,6 +980,7 @@ impl Simulator {
                 self.read_timer(host, curr_time, stream);
             }
         }
+        Ok(())
     }
 
     fn cuda_memcpy_async(
@@ -1670,8 +1817,9 @@ impl Simulator {
         comm: NcclComm,
         stream: CudaStream,
         call: CudaCall,
-    ) {
+    ) -> Result<(), CollectiveMismatch> {
         let nccl_id = NcclId(comm.id);
+        let args = CollectiveArgs::of(&call);
         let new_cc_waiting = || {
             let mut joined_ranks = HashSet::new();
             joined_ranks.insert(comm.rank);
@@ -1716,6 +1864,8 @@ impl Simulator {
                 comm_barrier,
                 joined_ranks,
                 waiting_for,
+                first_rank: comm.rank,
+                first_args: args,
             }
         };
 
@@ -1735,6 +1885,14 @@ impl Simulator {
                 }) {
                     None => waitings.push_back(new_cc_waiting()),
                     Some((idx, waiting)) => {
+                        check_collective_join(
+                            ranks,
+                            &comm.id,
+                            waiting.first_rank,
+                            &waiting.first_args,
+                            comm.rank,
+                            &args,
+                        )?;
                         waiting.waiting_for.remove(&comm.rank);
                         waiting.joined_ranks.insert(comm.rank);
 
@@ -1808,6 +1966,7 @@ impl Simulator {
                 }
             }
         }
+        Ok(())
     }
 
     fn nccl_bcast(
@@ -1820,7 +1979,7 @@ impl Simulator {
         comm: NcclComm,
         stream: CudaStream,
         call: CudaCall,
-    ) {
+    ) -> Result<(), CollectiveMismatch> {
         let ranks = &self.comm_groups[&NcclId(comm.id)];
         let trace = self.nccl_ops.bcast(root, ranks, count, dtype);
         Self::nccl_call(
@@ -1962,6 +2121,161 @@ fn untimed_kernel_lib(lib_path: &str) -> String {
     let base = base.split(".cpython").next().unwrap_or(base);
     let base = base.strip_suffix(".so").unwrap_or(base);
     if base.is_empty() { "unknown".to_owned() } else { base.to_owned() }
+}
+
+#[cfg(test)]
+mod collective_check_tests {
+    use super::{check_collective_join, CollectiveArgs};
+    use cuda_call::{CudaCall, CudaStream, HostId, NcclComm, NcclDatatype, NcclReduceOp};
+
+    fn comm(rank: i32) -> NcclComm {
+        let mut id = [0u8; 128];
+        id[0] = 3;
+        NcclComm { rank, id }
+    }
+
+    fn stream() -> CudaStream {
+        CudaStream { device: 0, id: 7 }
+    }
+
+    fn ranks() -> Vec<(HostId, i32)> {
+        (0..2)
+            .map(|r| {
+                (
+                    HostId {
+                        hostname: format!("host-{}", r + 1),
+                        pid: 100 + r as u32,
+                    },
+                    0,
+                )
+            })
+            .collect()
+    }
+
+    fn all_reduce(rank: i32, count: usize, dtype: NcclDatatype) -> CudaCall {
+        CudaCall::NcclAllReduce {
+            count,
+            dtype,
+            op: NcclReduceOp::Sum,
+            comm: comm(rank),
+            stream: stream(),
+        }
+    }
+
+    fn bcast(rank: i32, count: usize, root: i32) -> CudaCall {
+        CudaCall::NcclBcast {
+            count,
+            dtype: NcclDatatype::Bf16,
+            root,
+            comm: comm(rank),
+            stream: stream(),
+        }
+    }
+
+    fn check(first: &CudaCall, joining: &CudaCall) -> Result<(), String> {
+        let rank_of = |c: &CudaCall| match c {
+            CudaCall::NcclBcast { comm, .. }
+            | CudaCall::NcclAllReduce { comm, .. }
+            | CudaCall::NcclAllGather { comm, .. }
+            | CudaCall::NcclReduceScatter { comm, .. } => comm.rank,
+            _ => unreachable!(),
+        };
+        check_collective_join(
+            &ranks(),
+            &comm(0).id,
+            rank_of(first),
+            &CollectiveArgs::of(first),
+            rank_of(joining),
+            &CollectiveArgs::of(joining),
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn equal_arguments_pass() {
+        let bf = NcclDatatype::Bf16;
+        assert_eq!(check(&all_reduce(1, 64, bf), &all_reduce(0, 64, bf)), Ok(()));
+        assert_eq!(check(&bcast(0, 64, 1), &bcast(1, 64, 1)), Ok(()));
+        // Stream, reduce op and the rank itself are not compared.
+        let other_stream = CudaCall::NcclAllReduce {
+            count: 64,
+            dtype: bf,
+            op: NcclReduceOp::Max,
+            comm: comm(0),
+            stream: CudaStream { device: 1, id: 9 },
+        };
+        assert_eq!(check(&all_reduce(1, 64, bf), &other_stream), Ok(()));
+        for (a, b) in [
+            (
+                CudaCall::NcclAllGather { count: 8, dtype: bf, comm: comm(0), stream: stream() },
+                CudaCall::NcclAllGather { count: 8, dtype: bf, comm: comm(1), stream: stream() },
+            ),
+            (
+                CudaCall::NcclReduceScatter {
+                    count: 8,
+                    dtype: bf,
+                    op: NcclReduceOp::Sum,
+                    comm: comm(0),
+                    stream: stream(),
+                },
+                CudaCall::NcclReduceScatter {
+                    count: 8,
+                    dtype: bf,
+                    op: NcclReduceOp::Sum,
+                    comm: comm(1),
+                    stream: stream(),
+                },
+            ),
+        ] {
+            assert_eq!(check(&a, &b), Ok(()));
+        }
+    }
+
+    #[test]
+    fn count_mismatch_names_everything() {
+        let bf = NcclDatatype::Bf16;
+        let msg = check(&all_reduce(1, 256, bf), &all_reduce(0, 64, bf)).unwrap_err();
+        assert!(msg.contains("all-reduce (ncclAllReduce)"), "{msg}");
+        assert!(msg.contains("communicator #3 (2 ranks)"), "{msg}");
+        assert!(msg.contains("rank 1 (host-2 GPU 0 pid 101) called it with count 256 of Bf16 (512 bytes)"), "{msg}");
+        assert!(msg.contains("rank 0 (host-1 GPU 0 pid 100) joined it with count 64 of Bf16 (128 bytes)"), "{msg}");
+    }
+
+    #[test]
+    fn dtype_mismatch_with_equal_bytes_fails() {
+        let msg = check(
+            &all_reduce(0, 128, NcclDatatype::Bf16),
+            &all_reduce(1, 64, NcclDatatype::F32),
+        )
+        .unwrap_err();
+        assert!(msg.contains("count 128 of Bf16 (256 bytes)"), "{msg}");
+        assert!(msg.contains("count 64 of F32 (256 bytes)"), "{msg}");
+    }
+
+    #[test]
+    fn broadcast_root_mismatch_fails() {
+        let msg = check(&bcast(0, 64, 0), &bcast(1, 64, 1)).unwrap_err();
+        assert!(msg.contains("broadcast (ncclBcast)"), "{msg}");
+        assert!(msg.contains("root 0"), "{msg}");
+        assert!(msg.contains("root 1"), "{msg}");
+    }
+
+    #[test]
+    fn gather_and_scatter_name_their_per_rank_count() {
+        let bf = NcclDatatype::Bf16;
+        let ag = |rank, count| CudaCall::NcclAllGather { count, dtype: bf, comm: comm(rank), stream: stream() };
+        let msg = check(&ag(0, 8), &ag(1, 32)).unwrap_err();
+        assert!(msg.contains("all-gather (ncclAllGather)") && msg.contains("send count 32"), "{msg}");
+        let rs = |rank, count| CudaCall::NcclReduceScatter {
+            count,
+            dtype: bf,
+            op: NcclReduceOp::Sum,
+            comm: comm(rank),
+            stream: stream(),
+        };
+        let msg = check(&rs(0, 8), &rs(1, 32)).unwrap_err();
+        assert!(msg.contains("reduce-scatter (ncclReduceScatter)") && msg.contains("receive count 8"), "{msg}");
+    }
 }
 
 #[cfg(test)]

@@ -32,10 +32,27 @@ Simulator (phantora/)
     stub gains the driver calls Triton's launcher needs (cuLaunchKernelEx,
     cuFuncGet/SetAttribute, cuPointerGetAttribute(s), context calls), with H100-like
     values for the device attributes Triton reads.
+  - Collective argument check: a rank joining a broadcast, all-reduce, all-gather or
+    reduce-scatter with a count, datatype or root different from the first rank's
+    stops the simulation with a message (sim.log and the ranks' stderr; ranks abort).
+  - Equal-cost multipath (netsim): each flow takes one of the equal shortest paths
+    (with 2+ spines: one spine), picked by a fixed hash of (seed, source, destination,
+    size, count of earlier flows with the same three); upstream always took the first
+    spine. Seed: `ecmp_seed` in [simulator], default 0. No smarter load balancing.
 
 Tests and tools (tests/)
   - phantora_utils.py: mark_step(); optional skewed MoE routing for Megatron
     (PHANTORA_MOE_ROUTING=zipf:<s>).
+  - phantora_utils.py: mark_step() also writes one line per step with the process's
+    CPU time to $PHANTORA_STEP_LOG_DIR (nothing when unset); cluster-sim's
+    cpu_time_per_step check reads it.
+  - phantora_utils.py: gpt-oss experts are simulated with balanced top-k routing
+    (each expert gets tokens x top_k / experts tokens), by default as a grouped-matmul
+    expert layer; experts="hf_loop" reproduces stock transformers 4.56.2's per-expert
+    training loop. Raises instead of computing every expert for every token.
+  - phantora_utils.py: inside a CUDA torch.autocast region, ops on autocast's
+    lower-precision list get their inputs cast as autocast casts them, so they are
+    timed at the autocast dtype and the casts are charged.
   - test_megatron.py, test_deepspeed.py, test_torchtitan.py: step markers;
     test_megatron.py --moe_routing.
   - perfdb/bench.py: Generic op timing (schema-aligned arguments, crash-isolated
